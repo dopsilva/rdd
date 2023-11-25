@@ -20,6 +20,8 @@ func TestCreateTable(t *testing.T) {
 		Nome        Field[string]         `rdd-column:"nome" rdd-nullable:"false"`
 		IncluidoEm  Field[time.Time]      `rdd-column:"incluido_em"`
 		IncluidoPor Field[sql.NullString] `rdd-column:"incluido_por"`
+
+		ConstraintIncluidoPor Constraint `rdd-foreign-key:"incluido_por" rdd-foreign-key-reference:"usuarios"`
 	}
 
 	db, err := Connect(SQLite, ":memory:")

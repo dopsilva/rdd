@@ -148,3 +148,5 @@ func (f *Field[T]) Scan(value any) error {
 	f.Set(value.(T))
 	return nil
 }
+
+type Constraint struct{}

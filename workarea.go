@@ -24,11 +24,17 @@ type Workarea[T any] interface {
 	Event(params EventParameters) error
 }
 
+type foreignKey struct {
+	fields    []string
+	reference string
+}
+
 type workarea[T any] struct {
 	entity *T
 	table  string
 	fields map[string]fieldSchema
 	lastop Operation
+	fks    []foreignKey
 }
 
 type fieldSchema struct {
@@ -139,6 +145,17 @@ func newWorkarea[T any](entity *T) (Workarea[T], error) {
 
 					w.fields[columnName] = column
 				}
+			} else {
+				var fkf, fkr string
+				if tv, ok := rt.Field(i).Tag.Lookup("rdd-foreign-key"); ok {
+					fkf = tv
+					if tv, ok := rt.Field(i).Tag.Lookup("rdd-foreign-key-reference"); !ok {
+						panic("foreign key sem referencia")
+					} else {
+						fkr = tv
+					}
+					w.fks = append(w.fks, foreignKey{[]string{fkf}, fkr})
+				}
 			}
 		}
 	}
@@ -198,8 +215,23 @@ func (w *workarea[T]) CreateTable(ctx context.Context, db Database, options *Cre
 		b.WriteString(", unique (" + quotedIdentifier(db.Engine(), uk.name) + ")")
 	}
 
+	if len(w.fks) > 0 {
+		for _, c := range w.fks {
+			cn := "fk"
+			cf := ""
+			for i, f := range c.fields {
+				if i > 0 {
+					cf += ", "
+				}
+				cn += "_" + f
+				cf += db.Engine().QuotedIdentifier(f)
+			}
+			b.WriteString(" constraint " + cn + " foreign key (" + cf + ") references (" + db.Engine().QuotedIdentifier(c.reference) + ")")
+		}
+	}
+
 	b.WriteString(");")
-	//fmt.Println(b.String())
+	fmt.Println(b.String())
 
 	if _, err := db.Exec(b.String()); err != nil {
 		return err
