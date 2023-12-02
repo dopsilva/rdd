@@ -7,63 +7,62 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 type Workarea[T any] interface {
+	Schema() *TableSchema
+	Entity() string
+
 	CreateTable(ctx context.Context, db Database, options *CreateTableOptions) error
 
+	// Append realiza um insert no banco de dados
 	Append(ctx context.Context, db Database) error
+	// Replace realiza um update no banco de dados
 	Replace(ctx context.Context, db Database) error
-	Delete(ctx context.Context, db Database) error
+	// Remove realiza um delete no banco de dados
+	Remove(ctx context.Context, db Database) error
 
 	Changed() bool
 	Load(src any) error
 	Freeze()
+	Reset()
 
-	Event(params EventParameters) error
+	GetFieldsAddr(columns []string) []any
+
+	Customizable
 }
 
-type foreignKey struct {
-	fields    []string
-	reference string
+type Customizable interface {
+	BeforeAppend(params EventParameters) error
+	AfterAppend(params EventParameters) error
+	BeforeReplace(params EventParameters) error
+	AfterReplace(params EventParameters) error
+	BeforeRemove(params EventParameters) error
+	AfterRemove(params EventParameters) error
+	AfterCommit(params EventParameters) error
+	OnError(err error, params EventParameters) error
 }
 
 type workarea[T any] struct {
 	entity *T
-	table  string
-	fields map[string]fieldSchema
+	schema *TableSchema
+	fields map[string]fieldInstance
 	lastop Operation
-	fks    []foreignKey
 }
 
-type fieldSchema struct {
-	name      string
-	pk        bool
-	uk        bool
-	auto      bool
-	nullable  bool
-	def       string
+type fieldInstance struct {
+	schema    FieldSchema
 	fieldaddr any
 	fieldtype string
 }
 
-type EventType int
-
-const (
-	BeforeAppend EventType = iota
-	AfterAppend
-	BeforeReplace
-	AfterReplace
-	BeforeDelete
-	AfterDelete
-	AfterCommit
-)
-
 type Operation int
 
 const (
-	Append Operation = iota
+	None Operation = iota
+	Append
 	Replace
 	Delete
 )
@@ -71,110 +70,208 @@ const (
 type EventParameters struct {
 	Context   context.Context
 	Database  Database
-	Type      EventType
 	Operation Operation
 }
 
-func Use[T any]() (*T, error) {
-	i := new(T)
-	w, err := newWorkarea[T](i)
-	if err != nil {
-		return nil, err
+var (
+	entitiesPool  = make(map[string]*sync.Pool, 0)
+	entitiesMutex = sync.Mutex{}
+)
+
+// Use faz o uso da entidade. Importante que após o uso, a entidade seja fechada com Close.
+func Use[T any]() *T {
+	var e *T
+
+	en := reflect.TypeOf(e).Elem().Name()
+	p, ok := entitiesPool[en]
+	if !ok {
+		entitiesMutex.Lock()
+
+		p = &sync.Pool{
+			New: func() any {
+				// instancia a entidade
+				i := new(T)
+
+				// instancia a workarea
+				w := newWorkarea[T](i)
+
+				// define a entidade a workarea
+				// TODO: verificar se o field Workarea existe
+				reflect.ValueOf(i).Elem().FieldByName("Workarea").Set(reflect.ValueOf(w))
+
+				return i
+			},
+		}
+		entitiesPool[en] = p
+
+		entitiesMutex.Unlock()
 	}
 
-	// TODO: verificar se o field Workarea existe
-	reflect.ValueOf(i).Elem().FieldByName("Workarea").Set(reflect.ValueOf(w))
-
-	return i, nil
+	return p.Get().(*T)
 }
 
-func newWorkarea[T any](entity *T) (Workarea[T], error) {
+// Close "fecha" a workarea retornando para o pool de entidades
+func Close[T any](e *T) {
+	// pega a workarea
+	w := any(e).(Workarea[T])
+	// reseta os valores
+	w.Reset()
+	// armazena no pool
+	entitiesPool[w.Entity()].Put(e)
+}
+
+func newWorkarea[T any](entity *T) Workarea[T] {
+	schemaCached := true
+
 	w := &workarea[T]{
 		entity: entity,
-		fields: make(map[string]fieldSchema, 0),
+		fields: make(map[string]fieldInstance, 0),
 	}
 
 	rv := reflect.ValueOf(entity).Elem()
 	rt := reflect.TypeOf(entity).Elem()
+
+	if v, ok := registeredSchemas[rt.Name()]; ok {
+		w.schema = v
+	} else {
+		w.schema = &TableSchema{}
+		w.schema.Fields = make(map[string]FieldSchema, 0)
+		schemaCached = false
+	}
 
 	for i := 0; i < rv.NumField(); i++ {
 		f := rv.Field(i).Addr()
 
 		switch v := f.Interface().(type) {
 		case *Workarea[T]:
-			if tv, ok := rt.Field(i).Tag.Lookup("rdd-table"); ok {
-				w.table = tv
-			} else {
-				return nil, errors.New("workarea: rdd-table not defined")
+			if !schemaCached {
+				if tv, ok := rt.Field(i).Tag.Lookup("rdd-table"); ok {
+					w.schema.Name = tv
+				} else {
+					panic(errors.New("workarea: rdd-table not defined"))
+				}
 			}
 		default:
 			if ti, ok := v.(Typed); ok {
 				columnName, ok := rt.Field(i).Tag.Lookup("rdd-column")
 				if ok {
-					var pk, uk, auto, nullable bool
-					var def string
+					// se não está cacheado o schema, lemos as informações das tags
+					if !schemaCached {
+						var pk, uk, auto, nullable bool
+						var def string
 
-					if tv, ok := rt.Field(i).Tag.Lookup("rdd-primary-key"); ok {
-						pk, _ = strconv.ParseBool(tv)
-					}
-					if tv, ok := rt.Field(i).Tag.Lookup("rdd-unique-key"); ok {
-						uk, _ = strconv.ParseBool(tv)
-					}
-					if tv, ok := rt.Field(i).Tag.Lookup("rdd-auto-generated"); ok {
-						auto, _ = strconv.ParseBool(tv)
-					}
-					if tv, ok := rt.Field(i).Tag.Lookup("rdd-nullable"); ok {
-						nullable, _ = strconv.ParseBool(tv)
-					} else {
-						nullable = true
-					}
-					if tv, ok := rt.Field(i).Tag.Lookup("rdd-default"); ok {
-						def = tv
+						if tv, ok := rt.Field(i).Tag.Lookup("rdd-primary-key"); ok {
+							pk, _ = strconv.ParseBool(tv)
+						}
+						if tv, ok := rt.Field(i).Tag.Lookup("rdd-unique-key"); ok {
+							uk, _ = strconv.ParseBool(tv)
+						}
+						if tv, ok := rt.Field(i).Tag.Lookup("rdd-auto-generated"); ok {
+							auto, _ = strconv.ParseBool(tv)
+						}
+						if tv, ok := rt.Field(i).Tag.Lookup("rdd-nullable"); ok {
+							nullable, _ = strconv.ParseBool(tv)
+						} else {
+							nullable = false
+						}
+						if tv, ok := rt.Field(i).Tag.Lookup("rdd-default"); ok {
+							def = tv
+						}
+
+						w.schema.Fields[columnName] = FieldSchema{
+							Name:          columnName,
+							PrimaryKey:    pk,
+							UniqueKey:     uk,
+							AutoGenerated: auto,
+							Nullable:      nullable,
+							Default:       def,
+							FieldType:     ti.Type().Name(),
+						}
 					}
 
-					column := fieldSchema{
-						name:      columnName,
-						pk:        pk,
-						uk:        uk,
-						auto:      auto,
-						nullable:  nullable,
-						def:       def,
+					fi := fieldInstance{
+						schema:    w.schema.Fields[columnName],
 						fieldaddr: f.Interface(),
 						fieldtype: ti.Type().Name(),
 					}
 
-					w.fields[columnName] = column
+					// armazena a instância do campo
+					// para facilitar algumas operações
+					w.fields[columnName] = fi
 				}
 			} else {
-				var fkf, fkr string
-				if tv, ok := rt.Field(i).Tag.Lookup("rdd-foreign-key"); ok {
-					fkf = tv
-					if tv, ok := rt.Field(i).Tag.Lookup("rdd-foreign-key-reference"); !ok {
-						panic("foreign key sem referencia")
-					} else {
-						fkr = tv
+				// se não está cacheado o schema, lemos as informações das tags
+				if !schemaCached {
+					var fkf, fkr string
+					if tv, ok := rt.Field(i).Tag.Lookup("rdd-foreign-key"); ok {
+						fkf = tv
+						if tv, ok := rt.Field(i).Tag.Lookup("rdd-foreign-key-reference"); !ok {
+							panic("foreign key sem referência")
+						} else {
+							fkr = tv
+						}
+						w.schema.ForeignKeys = append(w.schema.ForeignKeys, ForeignKeySchema{[]string{fkf}, fkr})
 					}
-					w.fks = append(w.fks, foreignKey{[]string{fkf}, fkr})
 				}
 			}
 		}
 	}
 
-	return w, nil
+	// se não está cacheado o schema, colocamos no cache
+	if !schemaCached {
+		registeredSchemas[rt.Name()] = w.schema
+	}
+
+	return w
+}
+
+// Schema retorna o schema da workarea
+func (w *workarea[T]) Schema() *TableSchema {
+	return w.schema
+}
+
+// Entity retorna o nome da entidade (estrutura em go)
+func (w *workarea[T]) Entity() string {
+	return reflect.TypeOf(w.entity).Elem().Name()
+}
+
+// GetFieldsAddr retorna a lista de endereços dos campos através do seu nome de coluna
+func (w *workarea[T]) GetFieldsAddr(columns []string) []any {
+	r := make([]any, 0)
+
+	for _, c := range columns {
+		for k, v := range w.fields {
+			if c == k {
+				r = append(r, v.fieldaddr)
+			}
+		}
+	}
+
+	return r
 }
 
 type CreateTableOptions struct {
-	IfNotExists bool
+	IfNotExists  bool
+	DropIfExists bool
 }
 
+// CreateTable cria a tabela no banco de dados
 func (w *workarea[T]) CreateTable(ctx context.Context, db Database, options *CreateTableOptions) error {
+	return tableCreate(db, w.schema, options)
+}
+
+func tableCreate(db Database, schema *TableSchema, options *CreateTableOptions) error {
 	var b strings.Builder
-	pk := make([]fieldSchema, 0)
-	var uk *fieldSchema
+	pk := make([]FieldSchema, 0)
+	var uk *FieldSchema
 	opt := CreateTableOptions{}
 
 	if options != nil {
 		opt = *options
+	}
+
+	if opt.DropIfExists {
+		b.WriteString("drop table if exists " + db.Engine().QuotedIdentifier(schema.Name) + ";")
 	}
 
 	b.WriteString("create table")
@@ -183,40 +280,46 @@ func (w *workarea[T]) CreateTable(ctx context.Context, db Database, options *Cre
 		b.WriteString(" if not exists")
 	}
 
-	b.WriteString(" " + quotedIdentifier(db.Engine(), w.table) + " (")
+	b.WriteString(" " + db.Engine().QuotedIdentifier(schema.Name) + " (")
 
 	n := 0
-	for _, f := range w.fields {
+	for _, f := range schema.Fields {
 		if n > 0 {
 			b.WriteString(", ")
 		}
 		b.WriteString(columnCreate(db, f))
-		if f.pk {
+		if f.PrimaryKey {
 			pk = append(pk, f)
 		}
-		if f.uk {
+		if f.UniqueKey {
 			uk = &f
 		}
 		n++
 	}
 
 	if len(pk) > 0 {
-		b.WriteString(", primary key (")
+		cn := "pk_" + schema.Name
+		for _, f := range pk {
+			cn += "_" + f.Name
+		}
+		b.WriteString(", constraint " + cn + " primary key (")
 		for i, f := range pk {
 			if i > 0 {
 				b.WriteString(", ")
 			}
-			b.WriteString(quotedIdentifier(db.Engine(), f.name))
+			b.WriteString(db.Engine().QuotedIdentifier(f.Name))
 		}
 		b.WriteString(")")
 	}
 
 	if uk != nil {
-		b.WriteString(", unique (" + quotedIdentifier(db.Engine(), uk.name) + ")")
+		cn := "uk_" + uk.Name
+		b.WriteString(", constraint " + cn + " unique (" + db.Engine().QuotedIdentifier(uk.Name) + ")")
 	}
 
-	if len(w.fks) > 0 {
-		for _, c := range w.fks {
+	if len(schema.ForeignKeys) > 0 {
+		b.WriteString(",")
+		for _, c := range schema.ForeignKeys {
 			cn := "fk"
 			cf := ""
 			for i, f := range c.fields {
@@ -226,12 +329,12 @@ func (w *workarea[T]) CreateTable(ctx context.Context, db Database, options *Cre
 				cn += "_" + f
 				cf += db.Engine().QuotedIdentifier(f)
 			}
-			b.WriteString(" constraint " + cn + " foreign key (" + cf + ") references (" + db.Engine().QuotedIdentifier(c.reference) + ")")
+			b.WriteString(" constraint " + cn + " foreign key (" + cf + ") references " + db.Engine().QuotedIdentifier(c.reference))
 		}
 	}
 
 	b.WriteString(");")
-	fmt.Println(b.String())
+	//fmt.Println(b.String())
 
 	if _, err := db.Exec(b.String()); err != nil {
 		return err
@@ -240,14 +343,14 @@ func (w *workarea[T]) CreateTable(ctx context.Context, db Database, options *Cre
 	return nil
 }
 
-func columnCreate(db Database, f fieldSchema) string {
+func columnCreate(db Database, f FieldSchema) string {
 	var b strings.Builder
 
-	b.WriteString(quotedIdentifier(db.Engine(), f.name))
+	b.WriteString(db.Engine().QuotedIdentifier(f.Name))
 
 	//fmt.Println(f.fieldtype)
 
-	switch f.fieldtype {
+	switch f.FieldType {
 	case "string", "NullString":
 		switch db.Engine() {
 		case SQLite:
@@ -275,15 +378,15 @@ func columnCreate(db Database, f fieldSchema) string {
 		}
 	}
 
-	if f.nullable {
+	if f.Nullable {
 		b.WriteString(" null")
 	} else {
 		b.WriteString(" not null")
 	}
 
-	if f.def != "" {
+	if f.Default != "" {
 		b.WriteString(" default ")
-		switch f.def {
+		switch f.Default {
 		case "new_uuid":
 			b.WriteString(db.Engine().DefaultRandomUUID())
 		case "now":
@@ -294,13 +397,14 @@ func columnCreate(db Database, f fieldSchema) string {
 	return b.String()
 }
 
+// Append realiza um insert no banco de dados
 func (w *workarea[T]) Append(ctx context.Context, db Database) error {
-	// verifica se implementa o event handler
+	// verifica se a entidade implementa o event handler
 	handler, hasHandler := implements[Workarea[T]](w)
 
 	// executa o event handler
 	if hasHandler {
-		if err := handler.Event(EventParameters{Type: BeforeAppend, Context: ctx, Database: db}); err != nil {
+		if err := handler.BeforeAppend(EventParameters{Context: ctx, Database: db}); err != nil {
 			return err
 		}
 	}
@@ -315,17 +419,17 @@ func (w *workarea[T]) Append(ctx context.Context, db Database) error {
 
 	if len(ret) == 0 {
 		if _, err := db.Exec(query, args...); err != nil {
-			return err
+			return handler.OnError(err, EventParameters{Context: ctx, Database: db, Operation: Append})
 		}
 	} else {
 		if err := db.QueryRow(query, args...).Scan(ret...); err != nil {
-			return err
+			return handler.OnError(err, EventParameters{Context: ctx, Database: db, Operation: Append})
 		}
 	}
 
 	// executa o event handler
 	if hasHandler {
-		if err := handler.Event(EventParameters{Type: AfterAppend, Context: ctx, Database: db}); err != nil {
+		if err := handler.AfterAppend(EventParameters{Context: ctx, Database: db}); err != nil {
 			return err
 		}
 	}
@@ -335,19 +439,20 @@ func (w *workarea[T]) Append(ctx context.Context, db Database) error {
 	if !db.WithinTransaction() {
 		w.Freeze()
 	} else {
-		// TODO: armazenar a workarea para dar um freeze depois do commit da transação
+		db.StoreWorkarea(w)
 	}
 
 	return nil
 }
 
+// Replace realiza um update no banco de dados
 func (w *workarea[T]) Replace(ctx context.Context, db Database) error {
 	// verifica se implementa o event handler
 	handler, hasHandler := implements[Workarea[T]](w)
 
 	// executa o event handler
 	if hasHandler {
-		if err := handler.Event(EventParameters{Type: BeforeReplace, Context: ctx, Database: db}); err != nil {
+		if err := handler.BeforeReplace(EventParameters{Context: ctx, Database: db}); err != nil {
 			return err
 		}
 	}
@@ -358,21 +463,21 @@ func (w *workarea[T]) Replace(ctx context.Context, db Database) error {
 		return err
 	}
 
-	fmt.Println(query)
+	//fmt.Println(query)
 
 	if len(ret) == 0 {
 		if _, err := db.Exec(query, args...); err != nil {
-			return err
+			return handler.OnError(err, EventParameters{Context: ctx, Database: db, Operation: Append})
 		}
 	} else {
 		if err := db.QueryRow(query, args...).Scan(ret...); err != nil {
-			return err
+			return handler.OnError(err, EventParameters{Context: ctx, Database: db, Operation: Append})
 		}
 	}
 
 	// executa o event handler
 	if hasHandler {
-		if err := handler.Event(EventParameters{Type: AfterReplace, Context: ctx, Database: db}); err != nil {
+		if err := handler.AfterReplace(EventParameters{Context: ctx, Database: db}); err != nil {
 			return err
 		}
 	}
@@ -382,18 +487,53 @@ func (w *workarea[T]) Replace(ctx context.Context, db Database) error {
 	if !db.WithinTransaction() {
 		w.Freeze()
 	} else {
-		// TODO: armazenar a workarea para dar um freeze depois do commit da transação
+		db.StoreWorkarea(w)
 	}
 
 	return nil
 }
 
-func (w *workarea[T]) Delete(ctx context.Context, db Database) error {
+// Remove realiza um delete no banco de dados
+func (w *workarea[T]) Remove(ctx context.Context, db Database) error {
+	// verifica se implementa o event handler
+	handler, hasHandler := implements[Workarea[T]](w)
+
+	// executa o event handler
+	if hasHandler {
+		if err := handler.BeforeRemove(EventParameters{Context: ctx, Database: db}); err != nil {
+			return err
+		}
+	}
+
+	// executa o update
+	query, args := w.generateDelete(db.Engine())
+
+	//fmt.Println(query)
+
+	if _, err := db.Exec(query, args...); err != nil {
+		return handler.OnError(err, EventParameters{Context: ctx, Database: db, Operation: Append})
+	}
+
+	// executa o event handler
+	if hasHandler {
+		if err := handler.AfterRemove(EventParameters{Context: ctx, Database: db}); err != nil {
+			return err
+		}
+	}
+
 	w.lastop = Delete
+
+	if !db.WithinTransaction() {
+		w.Freeze()
+	} else {
+		db.StoreWorkarea(w)
+	}
+
 	return nil
 }
 
-func (w workarea[T]) Changed() bool {
+// Changed verifica se houve alguma alteração nos campos da workarea
+func (w *workarea[T]) Changed() bool {
 	for _, v := range w.fields {
 		if f, ok := v.fieldaddr.(Changeable); ok {
 			if f.Changed() {
@@ -404,7 +544,8 @@ func (w workarea[T]) Changed() bool {
 	return false
 }
 
-func (w workarea[T]) Freeze() {
+// Freeze congela as informações. Após isso o Changed retorna falso
+func (w *workarea[T]) Freeze() {
 	for _, v := range w.fields {
 		if f, ok := v.fieldaddr.(Freezable); ok {
 			f.Freeze()
@@ -412,7 +553,18 @@ func (w workarea[T]) Freeze() {
 	}
 }
 
-func (w workarea[T]) Load(src any) error {
+// Reset zera as informações da workarea.
+func (w *workarea[T]) Reset() {
+	w.lastop = None
+	for _, v := range w.fields {
+		if f, ok := v.fieldaddr.(Resetable); ok {
+			f.Reset()
+		}
+	}
+}
+
+// Load carrega uma estrutura para a workarea
+func (w *workarea[T]) Load(src any) error {
 	rv := reflect.ValueOf(src)
 	rt := reflect.TypeOf(src)
 
@@ -420,21 +572,8 @@ func (w workarea[T]) Load(src any) error {
 		sv := rv.Field(i).Interface()
 
 		if columnName, ok := rt.Field(i).Tag.Lookup("rdd-column"); ok {
-			if column, ok := w.fields[columnName]; ok {
-				switch v := sv.(type) {
-				case string:
-					(column.fieldaddr.(*Field[string])).Set(v)
-				case int:
-					(column.fieldaddr.(*Field[int])).Set(v)
-				case int64:
-					(column.fieldaddr.(*Field[int64])).Set(v)
-				case float64:
-					(column.fieldaddr.(*Field[float64])).Set(v)
-				case bool:
-					(column.fieldaddr.(*Field[bool])).Set(v)
-				case time.Time:
-					(column.fieldaddr.(*Field[time.Time])).Set(v)
-				}
+			if field, ok := w.fields[columnName]; ok {
+				w.setField(field, sv)
 			}
 		}
 	}
@@ -442,29 +581,72 @@ func (w workarea[T]) Load(src any) error {
 	return nil
 }
 
-func (w workarea[T]) Event(params EventParameters) error {
-	return nil
+func (w *workarea[T]) setField(fi fieldInstance, sv any) {
+	switch v := sv.(type) {
+	case string:
+		(fi.fieldaddr.(*Field[string])).Set(v)
+	case int64:
+		(fi.fieldaddr.(*Field[int64])).Set(v)
+	case float64:
+		(fi.fieldaddr.(*Field[float64])).Set(v)
+	case bool:
+		(fi.fieldaddr.(*Field[bool])).Set(v)
+	case time.Time:
+		(fi.fieldaddr.(*Field[time.Time])).Set(v)
+	}
 }
+
+// BeforeAppend é executado antes de adicionar o registro no banco de dados
+func (w *workarea[T]) BeforeAppend(params EventParameters) error { return nil }
+
+// AfterAppend é executado depois de adicionar o registro no banco de dados
+func (w *workarea[T]) AfterAppend(params EventParameters) error { return nil }
+
+// BeforeReplace é executado antes de alterar o registro no banco de dados
+func (w *workarea[T]) BeforeReplace(params EventParameters) error { return nil }
+
+// AfterReplace é executado depois de alterar o registro no banco de dados
+func (w *workarea[T]) AfterReplace(params EventParameters) error { return nil }
+
+// BeforeRemove é executado antes de remover o registro no banco de dados
+func (w *workarea[T]) BeforeRemove(params EventParameters) error { return nil }
+
+// AfterRemove é executado depois de remover o registro no banco de dados
+func (w *workarea[T]) AfterRemove(params EventParameters) error { return nil }
+
+// AfterCommit é executado depois de confirmar a transação no banco de dados
+func (w *workarea[T]) AfterCommit(params EventParameters) error { return nil }
+
+// OnError
+func (w *workarea[T]) OnError(err error, params EventParameters) error { return nil }
 
 func implements[I, T any](w *workarea[T]) (I, bool) {
 	c, ok := any(w.entity).(I)
 	return c, ok
 }
 
-func (w workarea[T]) generateInsert(eng DatabaseEngine) (string, []any, []any, error) {
+// generateInsert gera o comando de insert no banco de dados e retorna or argumentos e
+// os campos que devem ser lidos após a execução do comando
+func (w *workarea[T]) generateInsert(eng DatabaseEngine) (string, []any, []any, error) {
 	var q strings.Builder
 	arguments := make([]any, 0)
-	retfields := make([]fieldSchema, 0)
+	retfields := make([]fieldInstance, 0)
 	returning := make([]any, 0)
 
-	q.WriteString("insert into " + eng.QuotedIdentifier(w.table) + " (")
+	q.WriteString("insert into " + eng.QuotedIdentifier(w.schema.Name) + " (")
 
 	n := 0
 	for k, v := range w.fields {
-		if v.auto {
+		if v.schema.AutoGenerated {
 			retfields = append(retfields, v)
 			returning = append(returning, v.fieldaddr)
 			continue
+		}
+		if ci, ok := v.fieldaddr.(Changeable); ok {
+			// não alterou o campo, ignora
+			if !ci.Changed() {
+				continue
+			}
 		}
 		if n > 0 {
 			q.WriteString(", ")
@@ -493,7 +675,7 @@ func (w workarea[T]) generateInsert(eng DatabaseEngine) (string, []any, []any, e
 			if n > 0 {
 				q.WriteString(", ")
 			}
-			q.WriteString(eng.QuotedIdentifier(v.name))
+			q.WriteString(eng.QuotedIdentifier(v.schema.Name))
 			n += 1
 		}
 	}
@@ -503,22 +685,24 @@ func (w workarea[T]) generateInsert(eng DatabaseEngine) (string, []any, []any, e
 	return q.String(), arguments, returning, nil
 }
 
-func (w workarea[T]) generateUpdate(eng DatabaseEngine) (string, []any, []any, error) {
+// generateUpdate gera o comando de update no banco de dados e retorna or argumentos e
+// os campos que devem ser lidos após a execução do comando
+func (w *workarea[T]) generateUpdate(eng DatabaseEngine) (string, []any, []any, error) {
 	var q strings.Builder
 	arguments := make([]any, 0)
-	retfields := make([]fieldSchema, 0)
+	retfields := make([]fieldInstance, 0)
 	returning := make([]any, 0)
-	pk := make([]fieldSchema, 0)
+	pk := make([]fieldInstance, 0)
 
-	q.WriteString("update " + eng.QuotedIdentifier(w.table) + " set ")
+	q.WriteString("update " + eng.QuotedIdentifier(w.schema.Name) + " set ")
 
 	n := 0
 	i := 1
 	for k, v := range w.fields {
-		if v.pk {
+		if v.schema.PrimaryKey {
 			pk = append(pk, v)
 		}
-		if v.auto {
+		if v.schema.AutoGenerated && !v.schema.PrimaryKey {
 			retfields = append(retfields, v)
 			returning = append(returning, v.fieldaddr)
 			continue
@@ -547,7 +731,7 @@ func (w workarea[T]) generateUpdate(eng DatabaseEngine) (string, []any, []any, e
 			if n > 0 {
 				q.WriteString(", ")
 			}
-			q.WriteString(eng.QuotedIdentifier(v.name))
+			q.WriteString(eng.QuotedIdentifier(v.schema.Name))
 			n += 1
 		}
 	}
@@ -561,7 +745,7 @@ func (w workarea[T]) generateUpdate(eng DatabaseEngine) (string, []any, []any, e
 		q.WriteString(where)
 		arguments = append(arguments, wargs...)
 	} else {
-		panic("tabela sem primary ou unique key definido")
+		panic("update: tabela sem primary ou unique key definido")
 	}
 
 	q.WriteString(";")
@@ -569,18 +753,39 @@ func (w workarea[T]) generateUpdate(eng DatabaseEngine) (string, []any, []any, e
 	return q.String(), arguments, returning, nil
 }
 
-func (w workarea[T]) wherePrimaryKey(eng DatabaseEngine, argsCount int) (string, []any, bool) {
+func (w *workarea[T]) generateDelete(eng DatabaseEngine) (string, []any) {
+	var sb strings.Builder
+	var where string
+	var wargs []any
+	var ok bool
+
+	sb.WriteString("delete from " + eng.QuotedIdentifier(w.schema.Name))
+	sb.WriteString(" where ")
+
+	if where, wargs, ok = w.wherePrimaryKey(eng, 0); ok {
+		sb.WriteString(where)
+	} else if where, wargs, ok = w.whereUniqueKey(eng, 0); ok {
+		sb.WriteString(where)
+	} else {
+		panic("delete: tabela sem primary ou unique key definido")
+	}
+
+	return sb.String(), wargs
+}
+
+// wherePrimaryKey cria a condição para a clausula where baseada na primary key da tabela
+func (w *workarea[T]) wherePrimaryKey(eng DatabaseEngine, argsCount int) (string, []any, bool) {
 	var sb strings.Builder
 	args := make([]any, 0)
 	haspk := false
 
 	i := 0
 	for _, v := range w.fields {
-		if v.pk {
+		if v.schema.PrimaryKey {
 			if i > 0 {
 				sb.WriteString(" and ")
 			}
-			sb.WriteString(eng.QuotedIdentifier(v.name) + " = " + fmt.Sprintf("$%d", argsCount+i+1))
+			sb.WriteString(eng.QuotedIdentifier(v.schema.Name) + " = " + fmt.Sprintf("$%d", argsCount+i+1))
 			args = append(args, v.fieldaddr)
 			haspk = true
 		}
@@ -589,26 +794,23 @@ func (w workarea[T]) wherePrimaryKey(eng DatabaseEngine, argsCount int) (string,
 	return sb.String(), args, haspk
 }
 
-func (w workarea[T]) whereUniqueKey(eng DatabaseEngine, argsCount int) (string, []any, bool) {
+// whereUniqueKey cria a condição para a clausula where baseada na unique key da tabela
+func (w *workarea[T]) whereUniqueKey(eng DatabaseEngine, argsCount int) (string, []any, bool) {
 	var sb strings.Builder
 	args := make([]any, 0)
 	hasuk := false
 
 	i := 0
 	for _, v := range w.fields {
-		if v.uk {
+		if v.schema.UniqueKey {
 			if i > 0 {
 				sb.WriteString(" and ")
 			}
-			sb.WriteString(eng.QuotedIdentifier(v.name) + " = " + fmt.Sprintf("$%d", argsCount+i+1))
+			sb.WriteString(eng.QuotedIdentifier(v.schema.Name) + " = " + fmt.Sprintf("$%d", argsCount+i+1))
 			args = append(args, v.fieldaddr)
 			hasuk = true
 		}
 	}
 
 	return sb.String(), args, hasuk
-}
-
-func quotedIdentifier(eng DatabaseEngine, v string) string {
-	return fmt.Sprintf("\"%s\"", v)
 }
