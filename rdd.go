@@ -82,7 +82,7 @@ type Resultset[T any] []*T
 
 func (r Resultset[T]) Close() {
 	for _, v := range r {
-		any(v).(Workarea[T]).Close[T]()
+		any(v).(Workarea[T]).Close()
 	}
 }
 

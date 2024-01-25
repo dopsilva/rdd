@@ -120,7 +120,7 @@ func (w *workarea[T]) Close() {
 	// reseta os valores
 	w.Reset()
 	// armazena no pool
-	entitiesPool[w.Entity()].Put(w)
+	entitiesPool[w.Entity()].Put(w.entity)
 }
 
 // Close "fecha" a workarea retornando para o pool de entidades
