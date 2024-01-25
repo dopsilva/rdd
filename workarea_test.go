@@ -51,7 +51,7 @@ func TestMain(m *testing.M) {
 
 	// criar as tabelas de teste
 	for _, v := range registeredSchemas {
-		if err := tableCreate(testDatabase, v, &CreateTableOptions{IfNotExists: true}); err != nil {
+		if err := CreateTable(testDatabase, v, &CreateTableOptions{IfNotExists: true}); err != nil {
 			panic(err)
 		}
 	}
@@ -68,7 +68,7 @@ func TestUpdate(t *testing.T) {
 	defer truncateTable(testDatabase, "usuarios")
 
 	u := Use[Usuario]()
-	defer Close[Usuario](u)
+	defer u.Close()
 
 	u.Email.Set("dopslv@gmail.com")
 	u.Nome.Set("Daniel")
@@ -107,7 +107,7 @@ func TestUpdate(t *testing.T) {
 
 func TestChanged(t *testing.T) {
 	u := Use[Usuario]()
-	defer Close(u)
+	defer u.Close()
 
 	type data struct {
 		Email      string    `rdd-column:"email"`
@@ -160,6 +160,7 @@ func TestTransaction(t *testing.T) {
 	defer truncateTable(testDatabase, "usuarios")
 
 	u := Use[Usuario]()
+	defer u.Close()
 
 	u.Email.Set("dopslv@gmail.com")
 	u.Nome.Set("Daniel")
@@ -233,7 +234,7 @@ func TestSelect(t *testing.T) {
 	}
 
 	u := Use[Usuario]()
-	defer Close(u)
+	defer u.Close()
 
 	for _, v := range usuarios {
 

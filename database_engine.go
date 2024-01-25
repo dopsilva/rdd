@@ -5,8 +5,8 @@ import "fmt"
 type DatabaseEngine int
 
 const (
-	Cockroach DatabaseEngine = iota
-	SQLite
+	SQLite DatabaseEngine = iota + 1
+	Cockroach
 )
 
 func (e DatabaseEngine) QuotedIdentifier(v any) string {

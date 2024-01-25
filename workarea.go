@@ -31,6 +31,11 @@ type Workarea[T any] interface {
 
 	GetFieldsAddr(columns []string) []any
 
+	Seek(db Database) error
+	SeekUnique(db Database) error
+
+	Close()
+
 	Customizable
 }
 
@@ -110,15 +115,23 @@ func Use[T any]() *T {
 	return p.Get().(*T)
 }
 
+// Entity retorna o nome da entidade (estrutura em go)
+func (w *workarea[T]) Close() {
+	// reseta os valores
+	w.Reset()
+	// armazena no pool
+	entitiesPool[w.Entity()].Put(w)
+}
+
 // Close "fecha" a workarea retornando para o pool de entidades
-func Close[T any](e *T) {
+/*func Close[T any](e *T) {
 	// pega a workarea
 	w := any(e).(Workarea[T])
 	// reseta os valores
 	w.Reset()
 	// armazena no pool
 	entitiesPool[w.Entity()].Put(e)
-}
+}*/
 
 func newWorkarea[T any](entity *T) Workarea[T] {
 	schemaCached := true
@@ -257,10 +270,10 @@ type CreateTableOptions struct {
 
 // CreateTable cria a tabela no banco de dados
 func (w *workarea[T]) CreateTable(ctx context.Context, db Database, options *CreateTableOptions) error {
-	return tableCreate(db, w.schema, options)
+	return CreateTable(db, w.schema, options)
 }
 
-func tableCreate(db Database, schema *TableSchema, options *CreateTableOptions) error {
+func CreateTable(db Database, schema *TableSchema, options *CreateTableOptions) error {
 	var b strings.Builder
 	pk := make([]FieldSchema, 0)
 	var uk *FieldSchema
@@ -287,7 +300,7 @@ func tableCreate(db Database, schema *TableSchema, options *CreateTableOptions) 
 		if n > 0 {
 			b.WriteString(", ")
 		}
-		b.WriteString(columnCreate(db, f))
+		b.WriteString(createColumn(db, f))
 		if f.PrimaryKey {
 			pk = append(pk, f)
 		}
@@ -343,7 +356,7 @@ func tableCreate(db Database, schema *TableSchema, options *CreateTableOptions) 
 	return nil
 }
 
-func columnCreate(db Database, f FieldSchema) string {
+func createColumn(db Database, f FieldSchema) string {
 	var b strings.Builder
 
 	b.WriteString(db.Engine().QuotedIdentifier(f.Name))
@@ -814,3 +827,6 @@ func (w *workarea[T]) whereUniqueKey(eng DatabaseEngine, argsCount int) (string,
 
 	return sb.String(), args, hasuk
 }
+
+func (w *workarea[T]) Seek(db Database) error       { return nil }
+func (w *workarea[T]) SeekUnique(db Database) error { return nil }

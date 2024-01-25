@@ -12,6 +12,10 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 )
 
+var (
+	ErrNotFound = errors.New("not found")
+)
+
 var onlyOnce sync.Once
 
 // Connect retorna a conexão com o banco de dados através da engine informada e da url de conexão.
@@ -64,11 +68,21 @@ func Register[T any]() {
 	}
 }
 
+func GetRegisteredSchemas() []*TableSchema {
+	ret := make([]*TableSchema, len(registeredSchemas))
+	i := 0
+	for _, v := range registeredSchemas {
+		ret[i] = v
+		i++
+	}
+	return ret
+}
+
 type Resultset[T any] []*T
 
 func (r Resultset[T]) Close() {
 	for _, v := range r {
-		Close[T](v)
+		any(v).(Workarea[T]).Close[T]()
 	}
 }
 
