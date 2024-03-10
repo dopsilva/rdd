@@ -7,6 +7,10 @@ import (
 	"runtime"
 	"testing"
 	"time"
+
+	"github.com/dopsilva/rdd/builder"
+	"github.com/dopsilva/rdd/engine"
+	"github.com/dopsilva/rdd/field"
 )
 
 var (
@@ -17,13 +21,13 @@ var (
 type Usuario struct {
 	Workarea[Usuario] `rdd-table:"usuarios"`
 
-	ID          Field[string]         `rdd-column:"id" rdd-primary-key:"true" rdd-auto-generated:"true" rdd-default:"new_uuid"`
-	Email       Field[string]         `rdd-column:"email" rdd-unique-key:"true"`
-	Nome        Field[string]         `rdd-column:"nome"`
-	IncluidoEm  Field[time.Time]      `rdd-column:"incluido_em"`
-	IncluidoPor Field[sql.NullString] `rdd-column:"incluido_por" rdd-nullable:"true"`
+	ID          field.Field[string]         `rdd-column:"id" rdd-primary-key:"true" rdd-auto-generated:"true" rdd-default:"new_uuid"`
+	Email       field.Field[string]         `rdd-column:"email" rdd-unique-key:"true"`
+	Nome        field.Field[string]         `rdd-column:"nome"`
+	IncluidoEm  field.Field[time.Time]      `rdd-column:"incluido_em"`
+	IncluidoPor field.Field[sql.NullString] `rdd-column:"incluido_por" rdd-nullable:"true"`
 
-	ConstraintIncluidoPor Constraint `rdd-foreign-key:"incluido_por" rdd-foreign-key-reference:"usuarios"`
+	ConstraintIncluidoPor field.Constraint `rdd-foreign-key:"incluido_por" rdd-foreign-key-reference:"usuarios"`
 }
 
 func (u *Usuario) BeforeAppend(params EventParameters) error {
@@ -43,7 +47,7 @@ func TestMain(m *testing.M) {
 	runtime.GC()
 	runtime.ReadMemStats(&m1)
 
-	testDatabase, err = Connect(SQLite, ":memory:")
+	testDatabase, err = Connect(engine.SQLite, ":memory:")
 	if err != nil {
 		panic(err)
 	}
@@ -51,7 +55,7 @@ func TestMain(m *testing.M) {
 
 	// criar as tabelas de teste
 	for _, v := range registeredSchemas {
-		if err := CreateTable(testDatabase, v, &CreateTableOptions{IfNotExists: true}); err != nil {
+		if err := testDatabase.CreateTable(v, &builder.CreateTableOptions{IfNotExists: true}); err != nil {
 			panic(err)
 		}
 	}

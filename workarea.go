@@ -9,13 +9,14 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/dopsilva/rdd/field"
+	"github.com/dopsilva/rdd/schema"
 )
 
 type Workarea[T any] interface {
-	Schema() *TableSchema
+	Schema() *schema.Table
 	Entity() string
-
-	CreateTable(ctx context.Context, db Database, options *CreateTableOptions) error
 
 	// Append realiza um insert no banco de dados
 	Append(ctx context.Context, db Database) error
@@ -36,10 +37,10 @@ type Workarea[T any] interface {
 
 	Close()
 
-	Customizable
+	Triggable
 }
 
-type Customizable interface {
+type Triggable interface {
 	BeforeAppend(params EventParameters) error
 	AfterAppend(params EventParameters) error
 	BeforeReplace(params EventParameters) error
@@ -52,13 +53,13 @@ type Customizable interface {
 
 type workarea[T any] struct {
 	entity *T
-	schema *TableSchema
+	schema *schema.Table
 	fields map[string]fieldInstance
 	lastop Operation
 }
 
 type fieldInstance struct {
-	schema    FieldSchema
+	schema    schema.Field
 	fieldaddr any
 	fieldtype string
 }
@@ -123,16 +124,6 @@ func (w *workarea[T]) Close() {
 	entitiesPool[w.Entity()].Put(w.entity)
 }
 
-// Close "fecha" a workarea retornando para o pool de entidades
-/*func Close[T any](e *T) {
-	// pega a workarea
-	w := any(e).(Workarea[T])
-	// reseta os valores
-	w.Reset()
-	// armazena no pool
-	entitiesPool[w.Entity()].Put(e)
-}*/
-
 func newWorkarea[T any](entity *T) Workarea[T] {
 	schemaCached := true
 
@@ -147,8 +138,8 @@ func newWorkarea[T any](entity *T) Workarea[T] {
 	if v, ok := registeredSchemas[rt.Name()]; ok {
 		w.schema = v
 	} else {
-		w.schema = &TableSchema{}
-		w.schema.Fields = make(map[string]FieldSchema, 0)
+		w.schema = &schema.Table{}
+		w.schema.Fields = make(map[string]schema.Field, 0)
 		schemaCached = false
 	}
 
@@ -165,7 +156,7 @@ func newWorkarea[T any](entity *T) Workarea[T] {
 				}
 			}
 		default:
-			if ti, ok := v.(Typed); ok {
+			if ti, ok := v.(field.Typed); ok {
 				columnName, ok := rt.Field(i).Tag.Lookup("rdd-column")
 				if ok {
 					// se não está cacheado o schema, lemos as informações das tags
@@ -191,7 +182,7 @@ func newWorkarea[T any](entity *T) Workarea[T] {
 							def = tv
 						}
 
-						w.schema.Fields[columnName] = FieldSchema{
+						w.schema.Fields[columnName] = schema.Field{
 							Name:          columnName,
 							PrimaryKey:    pk,
 							UniqueKey:     uk,
@@ -223,7 +214,7 @@ func newWorkarea[T any](entity *T) Workarea[T] {
 						} else {
 							fkr = tv
 						}
-						w.schema.ForeignKeys = append(w.schema.ForeignKeys, ForeignKeySchema{[]string{fkf}, fkr})
+						w.schema.ForeignKeys = append(w.schema.ForeignKeys, schema.ForeignKey{[]string{fkf}, fkr})
 					}
 				}
 			}
@@ -239,7 +230,7 @@ func newWorkarea[T any](entity *T) Workarea[T] {
 }
 
 // Schema retorna o schema da workarea
-func (w *workarea[T]) Schema() *TableSchema {
+func (w *workarea[T]) Schema() *schema.Table {
 	return w.schema
 }
 
@@ -261,153 +252,6 @@ func (w *workarea[T]) GetFieldsAddr(columns []string) []any {
 	}
 
 	return r
-}
-
-type CreateTableOptions struct {
-	IfNotExists  bool
-	DropIfExists bool
-}
-
-// CreateTable cria a tabela no banco de dados
-func (w *workarea[T]) CreateTable(ctx context.Context, db Database, options *CreateTableOptions) error {
-	return CreateTable(db, w.schema, options)
-}
-
-func CreateTable(db Database, schema *TableSchema, options *CreateTableOptions) error {
-	var b strings.Builder
-	pk := make([]FieldSchema, 0)
-	var uk *FieldSchema
-	opt := CreateTableOptions{}
-
-	if options != nil {
-		opt = *options
-	}
-
-	if opt.DropIfExists {
-		b.WriteString("drop table if exists " + db.Engine().QuotedIdentifier(schema.Name) + ";")
-	}
-
-	b.WriteString("create table")
-
-	if opt.IfNotExists {
-		b.WriteString(" if not exists")
-	}
-
-	b.WriteString(" " + db.Engine().QuotedIdentifier(schema.Name) + " (")
-
-	n := 0
-	for _, f := range schema.Fields {
-		if n > 0 {
-			b.WriteString(", ")
-		}
-		b.WriteString(createColumn(db, f))
-		if f.PrimaryKey {
-			pk = append(pk, f)
-		}
-		if f.UniqueKey {
-			uk = &f
-		}
-		n++
-	}
-
-	if len(pk) > 0 {
-		cn := "pk_" + schema.Name
-		for _, f := range pk {
-			cn += "_" + f.Name
-		}
-		b.WriteString(", constraint " + cn + " primary key (")
-		for i, f := range pk {
-			if i > 0 {
-				b.WriteString(", ")
-			}
-			b.WriteString(db.Engine().QuotedIdentifier(f.Name))
-		}
-		b.WriteString(")")
-	}
-
-	if uk != nil {
-		cn := "uk_" + uk.Name
-		b.WriteString(", constraint " + cn + " unique (" + db.Engine().QuotedIdentifier(uk.Name) + ")")
-	}
-
-	if len(schema.ForeignKeys) > 0 {
-		b.WriteString(",")
-		for _, c := range schema.ForeignKeys {
-			cn := "fk"
-			cf := ""
-			for i, f := range c.fields {
-				if i > 0 {
-					cf += ", "
-				}
-				cn += "_" + f
-				cf += db.Engine().QuotedIdentifier(f)
-			}
-			b.WriteString(" constraint " + cn + " foreign key (" + cf + ") references " + db.Engine().QuotedIdentifier(c.reference))
-		}
-	}
-
-	b.WriteString(");")
-	//fmt.Println(b.String())
-
-	if _, err := db.Exec(b.String()); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func createColumn(db Database, f FieldSchema) string {
-	var b strings.Builder
-
-	b.WriteString(db.Engine().QuotedIdentifier(f.Name))
-
-	//fmt.Println(f.fieldtype)
-
-	switch f.FieldType {
-	case "string", "NullString":
-		switch db.Engine() {
-		case SQLite:
-			b.WriteString(" text")
-		}
-	case "int", "int64", "NullInt64":
-		switch db.Engine() {
-		case SQLite:
-			b.WriteString(" integer")
-		}
-	case "bool", "NullBool":
-		switch db.Engine() {
-		case SQLite:
-			b.WriteString(" integer")
-		}
-	case "float64", "NullFloat64":
-		switch db.Engine() {
-		case SQLite:
-			b.WriteString(" real")
-		}
-	case "Time", "NullTime":
-		switch db.Engine() {
-		case SQLite:
-			b.WriteString(" text")
-		}
-	}
-
-	if f.Nullable {
-		b.WriteString(" null")
-	} else {
-		b.WriteString(" not null")
-	}
-
-	if f.Default != "" {
-		b.WriteString(" default ")
-		switch f.Default {
-		case "new_uuid":
-			b.WriteString(db.Engine().DefaultRandomUUID())
-		case "now":
-			b.WriteString(db.Engine().DefaultCurrentTimestamp())
-		}
-	}
-
-	return b.String()
 }
 
 // Append realiza um insert no banco de dados
@@ -548,7 +392,7 @@ func (w *workarea[T]) Remove(ctx context.Context, db Database) error {
 // Changed verifica se houve alguma alteração nos campos da workarea
 func (w *workarea[T]) Changed() bool {
 	for _, v := range w.fields {
-		if f, ok := v.fieldaddr.(Changeable); ok {
+		if f, ok := v.fieldaddr.(field.Changeable); ok {
 			if f.Changed() {
 				return true
 			}
@@ -560,7 +404,7 @@ func (w *workarea[T]) Changed() bool {
 // Freeze congela as informações. Após isso o Changed retorna falso
 func (w *workarea[T]) Freeze() {
 	for _, v := range w.fields {
-		if f, ok := v.fieldaddr.(Freezable); ok {
+		if f, ok := v.fieldaddr.(field.Freezable); ok {
 			f.Freeze()
 		}
 	}
@@ -570,7 +414,7 @@ func (w *workarea[T]) Freeze() {
 func (w *workarea[T]) Reset() {
 	w.lastop = None
 	for _, v := range w.fields {
-		if f, ok := v.fieldaddr.(Resetable); ok {
+		if f, ok := v.fieldaddr.(field.Resetable); ok {
 			f.Reset()
 		}
 	}
@@ -597,15 +441,15 @@ func (w *workarea[T]) Load(src any) error {
 func (w *workarea[T]) setField(fi fieldInstance, sv any) {
 	switch v := sv.(type) {
 	case string:
-		(fi.fieldaddr.(*Field[string])).Set(v)
+		(fi.fieldaddr.(*field.Field[string])).Set(v)
 	case int64:
-		(fi.fieldaddr.(*Field[int64])).Set(v)
+		(fi.fieldaddr.(*field.Field[int64])).Set(v)
 	case float64:
-		(fi.fieldaddr.(*Field[float64])).Set(v)
+		(fi.fieldaddr.(*field.Field[float64])).Set(v)
 	case bool:
-		(fi.fieldaddr.(*Field[bool])).Set(v)
+		(fi.fieldaddr.(*field.Field[bool])).Set(v)
 	case time.Time:
-		(fi.fieldaddr.(*Field[time.Time])).Set(v)
+		(fi.fieldaddr.(*field.Field[time.Time])).Set(v)
 	}
 }
 
@@ -655,7 +499,7 @@ func (w *workarea[T]) generateInsert(eng DatabaseEngine) (string, []any, []any, 
 			returning = append(returning, v.fieldaddr)
 			continue
 		}
-		if ci, ok := v.fieldaddr.(Changeable); ok {
+		if ci, ok := v.fieldaddr.(field.Changeable); ok {
 			// não alterou o campo, ignora
 			if !ci.Changed() {
 				continue
@@ -720,7 +564,7 @@ func (w *workarea[T]) generateUpdate(eng DatabaseEngine) (string, []any, []any, 
 			returning = append(returning, v.fieldaddr)
 			continue
 		}
-		if c, ok := v.fieldaddr.(Changeable); ok {
+		if c, ok := v.fieldaddr.(field.Changeable); ok {
 			if !c.Changed() {
 				continue
 			}

@@ -1,4 +1,4 @@
-package rdd
+package field
 
 import (
 	"database/sql"
@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"reflect"
 	"time"
+
+	"github.com/dopsilva/rdd/schema"
 )
 
 type Typed interface {
@@ -24,13 +26,37 @@ type Resetable interface {
 	Reset()
 }
 
-type Fieldable[T comparable] interface {
+type Valuer interface {
+	Value() (driver.Value, error)
+}
+
+type Fieldable interface {
+	Typed
+	Changeable
+	Freezable
+	Resetable
+	Valuer
+}
+
+type FieldConstraint[T comparable] interface {
 	string | int64 | bool | float64 | time.Time | sql.NullString | sql.NullInt64 | sql.NullBool | sql.NullFloat64 | sql.NullTime
 }
 
-type Field[T Fieldable[T]] struct {
-	value T
-	old   T
+type Field[T FieldConstraint[T]] struct {
+	schema schema.Field
+	value  T
+	old    T
+}
+
+type FieldInstance struct {
+	Schema schema.Field
+	Addr   any
+	Type   string
+}
+
+// Name obtém o nome do campo
+func (f *Field[T]) Name() string {
+	return f.schema.Name
 }
 
 // Get obtém o valor do campo

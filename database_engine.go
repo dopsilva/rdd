@@ -7,6 +7,7 @@ type DatabaseEngine int
 const (
 	SQLite DatabaseEngine = iota + 1
 	Cockroach
+	SQLServer
 )
 
 func (e DatabaseEngine) QuotedIdentifier(v any) string {

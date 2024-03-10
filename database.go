@@ -5,6 +5,9 @@ import (
 	"database/sql"
 	"strings"
 
+	"github.com/dopsilva/rdd/builder"
+	"github.com/dopsilva/rdd/field"
+	"github.com/dopsilva/rdd/schema"
 	"github.com/google/uuid"
 	"github.com/lib/pq"
 	sqlite "github.com/mattn/go-sqlite3"
@@ -22,16 +25,20 @@ type Database interface {
 	Close() error
 
 	Engine() DatabaseEngine
+	Builder() builder.Builder
+
+	CreateTable(table *schema.Table, options *builder.CreateTableOptions) error
 
 	WithinTransaction() bool
 	IsDuplicatedError(err error) bool
 
-	StoreWorkarea(Freezable)
+	StoreWorkarea(field.Freezable)
 }
 
 type DatabaseWrapper struct {
-	db     *sql.DB
-	engine DatabaseEngine
+	db      *sql.DB
+	engine  DatabaseEngine
+	builder builder.Builder
 }
 
 func (db *DatabaseWrapper) Exec(q string, args ...any) (sql.Result, error) {
@@ -71,17 +78,34 @@ func (db *DatabaseWrapper) IsDuplicatedError(err error) bool {
 	return IsDuplicatedError(err)
 }
 
-func (db *DatabaseWrapper) StoreWorkarea(f Freezable) {
+func (db *DatabaseWrapper) StoreWorkarea(f field.Freezable) {
 }
 
 func (db *DatabaseWrapper) Engine() DatabaseEngine {
 	return db.engine
 }
 
+func (db *DatabaseWrapper) Builder() builder.Builder {
+	return db.builder
+}
+
+func (db *DatabaseWrapper) CreateTable(table *schema.Table, options *builder.CreateTableOptions) error {
+	q, err := db.builder.CreateTable(table, options)
+	if err != nil {
+		return err
+	}
+
+	if _, err := db.Exec(q); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 type TransactionWrapper struct {
 	db        *DatabaseWrapper
 	tx        *sql.Tx
-	workareas []Freezable
+	workareas []field.Freezable
 	savepoint bool
 	spname    string // savepoint name
 }
@@ -123,7 +147,7 @@ func (tx *TransactionWrapper) Commit(ctx context.Context) error {
 		// congela as workareas
 		for _, w := range tx.workareas {
 			// dispara o evento AfterCommit da workarea
-			any(w).(Customizable).AfterCommit(EventParameters{Context: ctx, Database: tx.db})
+			any(w).(Triggable).AfterCommit(EventParameters{Context: ctx, Database: tx.db})
 			w.Freeze()
 		}
 	} else {
@@ -164,7 +188,15 @@ func (tx *TransactionWrapper) Engine() DatabaseEngine {
 	return tx.db.Engine()
 }
 
-func (tx *TransactionWrapper) StoreWorkarea(f Freezable) {
+func (tx *TransactionWrapper) Builder() builder.Builder {
+	return tx.db.builder
+}
+
+func (tx *TransactionWrapper) CreateTable(table *schema.Table, options *builder.CreateTableOptions) error {
+	return tx.db.CreateTable(table, options)
+}
+
+func (tx *TransactionWrapper) StoreWorkarea(f field.Freezable) {
 	tx.workareas = append(tx.workareas, f)
 }
 

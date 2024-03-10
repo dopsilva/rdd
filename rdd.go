@@ -5,6 +5,9 @@ import (
 	"errors"
 	"sync"
 
+	"github.com/dopsilva/rdd/builder"
+	"github.com/dopsilva/rdd/engine"
+	"github.com/dopsilva/rdd/schema"
 	"github.com/google/uuid"
 	sqlite "github.com/mattn/go-sqlite3"
 
@@ -19,19 +22,19 @@ var (
 var onlyOnce sync.Once
 
 // Connect retorna a conexão com o banco de dados através da engine informada e da url de conexão.
-func Connect(engine DatabaseEngine, url string) (Database, error) {
+func Connect(de engine.Engine, url string) (Database, error) {
 	var dbw Database
 	var db *sql.DB
 	var err error
 
-	switch engine {
-	case Cockroach:
+	switch de {
+	case engine.Cockroach:
 		db, err = sql.Open("postgres", url)
 		if err != nil {
 			return nil, err
 		}
 
-	case SQLite:
+	case engine.SQLite:
 		onlyOnce.Do(func() {
 			sql.Register("sqlite3_rdd", &sqlite.SQLiteDriver{
 				ConnectHook: func(conn *sqlite.SQLiteConn) error {
@@ -51,13 +54,13 @@ func Connect(engine DatabaseEngine, url string) (Database, error) {
 		}
 	}
 
-	dbw = &DatabaseWrapper{db: db, engine: engine}
+	dbw = &DatabaseWrapper{db: db, builder: builder.New(de)}
 
 	return dbw, nil
 }
 
 var (
-	registeredSchemas = make(map[string]*TableSchema)
+	registeredSchemas = make(map[string]*schema.Table)
 )
 
 // Register registra o schema da entidade.
@@ -68,8 +71,8 @@ func Register[T any]() {
 	}
 }
 
-func GetRegisteredSchemas() []*TableSchema {
-	ret := make([]*TableSchema, len(registeredSchemas))
+func GetRegisteredSchemas() []*schema.Table {
+	ret := make([]*schema.Table, len(registeredSchemas))
 	i := 0
 	for _, v := range registeredSchemas {
 		ret[i] = v
