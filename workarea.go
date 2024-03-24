@@ -206,7 +206,7 @@ func newWorkarea[T any](entity *T) Workarea[T] {
 						} else {
 							fkr = tv
 						}
-						w.schema.ForeignKeys = append(w.schema.ForeignKeys, schema.ForeignKey{[]string{fkf}, fkr})
+						w.schema.ForeignKeys = append(w.schema.ForeignKeys, schema.ForeignKey{Fields: []string{fkf}, Reference: fkr})
 					}
 				}
 			}
