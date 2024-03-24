@@ -68,6 +68,30 @@ func TestMain(m *testing.M) {
 	fmt.Println("mallocs:", m2.Mallocs-m1.Mallocs)
 }
 
+func truncateTable(db Database, table string) {
+	// TODO: tratar outros bancos de dados
+	_, err := db.Exec("delete from " + table)
+	if err != nil {
+		panic(err)
+	}
+}
+
+func TestInsert(t *testing.T) {
+	defer truncateTable(testDatabase, "usuarios")
+
+	u := Use[Usuario]()
+	defer u.Close()
+
+	u.Email.Set("dopslv@gmail.com")
+	u.Nome.Set("Daniel")
+	u.IncluidoEm.Set(time.Now())
+
+	if err := u.Append(testContext, testDatabase); err != nil {
+		t.Fatal(err)
+	}
+
+}
+
 func TestUpdate(t *testing.T) {
 	defer truncateTable(testDatabase, "usuarios")
 
@@ -149,14 +173,6 @@ func TestWorkAreaEvent(t *testing.T) {
 
 	if err := u.Append(testContext, testDatabase); err != nil {
 		t.Fatal(err)
-	}
-}
-
-func truncateTable(db Database, table string) {
-	// TODO: tratar outros bancos de dados
-	_, err := db.Exec("delete from " + table)
-	if err != nil {
-		panic(err)
 	}
 }
 

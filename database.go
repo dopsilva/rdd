@@ -213,6 +213,7 @@ func IsDuplicatedError(err error) bool {
 	}
 
 	// sqlite
+
 	if verr, ok := err.(sqlite.Error); ok {
 		if verr.Code == 19 && (verr.ExtendedCode == 1555 || verr.ExtendedCode == 2067) {
 			return true

@@ -13,9 +13,9 @@ type CreateTableOptions struct {
 
 type Builder interface {
 	CreateTable(*schema.Table, *CreateTableOptions) (string, error)
-	Insert(schema.Table, []field.Fieldable) (string, []any, []any, error)
-	Update(schema.Table, []field.Fieldable) (string, []any, []any, error)
-	Delete(schema.Table, []field.Fieldable) (string, []any)
+	Insert(schema.Table, []field.FieldInstance) (string, []any, []any, error)
+	Update(schema.Table, []field.FieldInstance) (string, []any, []any, error)
+	Delete(schema.Table, []field.FieldInstance) (string, []any)
 
 	QuotedIdentifier(i string) string
 	QuotedValue(v any) string
