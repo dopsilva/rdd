@@ -12,7 +12,6 @@ import (
 	sqlite "github.com/mattn/go-sqlite3"
 
 	_ "github.com/lib/pq"
-	_ "github.com/mattn/go-sqlite3"
 )
 
 var (
