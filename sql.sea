@@ -304,11 +304,57 @@ local function compile_cond(S, node, p)
     return error(`rdd/sql: operator '${tostring(op)}' is not supported`)
 end
 
+-- Raw SQL with ? placeholders: each ? outside quotes ('...', "...", [...] or
+-- `...`) becomes the dialect's placeholder for the next value; ?? is a
+-- literal ?.
+local QUOTE_CLOSE = {["'"] = "'", ["\""] = "\"", ["`"] = "`", ["["] = "]"}
+
+local function raw_text(sql, values, p)
+    local out = []
+    local n = 0
+    local i = 1
+    local size = len(sql)
+    while i <= size do
+        local ch = string.sub(sql, i, i)
+        local close = QUOTE_CLOSE[ch]
+        if close ~= nil then
+            local j = string.find(sql, close, i + 1)
+            if j == nil then return error(`rdd/sql: unterminated quote in raw SQL '${sql}'`) end
+            out[] = string.sub(sql, i, j)
+            i = j + 1
+        elseif ch == "?" and string.sub(sql, i + 1, i + 1) == "?" then
+            out[] = "?"
+            i += 2
+        elseif ch == "?" then
+            if n >= len(values) then return error(`rdd/sql: more '?' than values in raw SQL '${sql}'`) end
+            out[] = add_param(p, values[n], nil)
+            n += 1
+            i += 1
+        else
+            out[] = ch
+            i += 1
+        end
+    end
+    if n < len(values) then return error(`rdd/sql: more values than '?' in raw SQL '${sql}'`) end
+    return string.join(out, "")
+end
+
+-- sql.raw(sql, values, d) → {sql, params} | error — a hand-written statement
+-- with its ? turned into the dialect's placeholders
+function M.raw(sql, values, d)
+    local p = new_params(d)
+    local s = raw_text(sql, values or [], p)?
+    return {sql = s, params = p.values}
+end
+
 local function compile_filters(S, filters, p)
     local out = []
     for _, node in filters do
         local s
-        if node.kind == "group" then
+        if node.kind == "raw" then
+            s = raw_text(node.sql, node.values or [], p)?
+            s = `(${s})`
+        elseif node.kind == "group" then
             s = compile_filters(S, node.filters, p)?
             if s ~= "" then s = `(${s})` end
         else
@@ -685,6 +731,23 @@ function Conn.delete(self, schema, plan)
     return self.db:exec(st.sql, st.params)
 end
 
+-- conn:raw_query(sql, values [, schema]) → rows | error (documents of schema
+-- when given)
+function Conn.raw_query(self, sql, values, schema)
+    local st = M.raw(sql, values, self.dialect)?
+    local rows = self.db:query(st.sql, st.params)?
+    if schema == nil then return rows end
+    local out = []
+    for _, r in rows do out[] = M.hydrate(schema, r, nil, self.dialect) end
+    return out
+end
+
+-- conn:raw_exec(sql, values) → changed rows | error
+function Conn.raw_exec(self, sql, values)
+    local st = M.raw(sql, values, self.dialect)?
+    return self.db:exec(st.sql, st.params)
+end
+
 function Conn.transaction(self, fn)
     if type(self.db.transaction) ~= "function" then return fn(self) end
     return self.db:transaction(function(_) return fn(self) end)
@@ -709,6 +772,7 @@ function M.connection(db, d)
     c.db = db
     c.dialect = d or M.dialects.sqlite
     c.joins = true -- find/count/aggregate compile plan.joins
+    c.raw = true   -- and where_raw conditions
     for k, f in Conn do c[k] = f end
     return c
 end

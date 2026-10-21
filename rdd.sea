@@ -198,6 +198,24 @@ function Model.group_by(self, ...)
     return q.group_by(q, ...)
 end
 function Model.aggregate(self, specs) return self:query():aggregate(specs) end
+function Model.where_raw(self, sql, ...)
+    local q = self:query()
+    return q.where_raw(q, sql, ...)
+end
+function Model.or_where_raw(self, sql, ...)
+    local q = self:query()
+    return q.or_where_raw(q, sql, ...)
+end
+
+-- model:raw(sql, values...) → documents of this schema | error
+-- A hand-written query; each row comes back as a document (the schema's
+-- fields, bools and JSON columns decoded). Needs a driver with raw_query.
+function Model.raw(self, sql, ...)
+    if type(self.conn.raw_query) ~= "function" then
+        return error(`rdd: driver '${self.session.driver_name}' does not run raw SQL`)
+    end
+    return self.conn:raw_query(sql, [...], self.schema)
+end
 function Model.join(self, target, alias, on) return self:query():join(target, alias, on) end
 function Model.left_join(self, target, alias, on) return self:query():left_join(target, alias, on) end
 function Model.sum(self, field) return self:query():sum(field) end
@@ -250,6 +268,24 @@ function Session.transaction(self, fn)
         end)
     end
     return fn(self)
+end
+
+-- db:raw(sql, values...) → rows | error
+-- A hand-written query, ? taking the values as parameters (?? is a literal ?);
+-- rows come back as the database returns them. Needs a driver with raw_query.
+function Session.raw(self, sql, ...)
+    if type(self.conn.raw_query) ~= "function" then
+        return error(`rdd: driver '${self.driver_name}' does not run raw SQL`)
+    end
+    return self.conn:raw_query(sql, [...])
+end
+
+-- db:exec(sql, values...) → changed rows | error — a hand-written statement
+function Session.exec(self, sql, ...)
+    if type(self.conn.raw_exec) ~= "function" then
+        return error(`rdd: driver '${self.driver_name}' does not run raw SQL`)
+    end
+    return self.conn:raw_exec(sql, [...])
 end
 
 -- db:close() → true | nil | error

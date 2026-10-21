@@ -512,6 +512,36 @@ t.describe("rdd end-to-end with registered SQLite driver", function()
         t.is_error(model:join(Pedidos, "p", "p.cliente_id = id"):where("p.pago", true):delete(), "does not take joins")
     end)
 
+    t.it("runs raw SQL: statements, model rows and where_raw", function()
+        local _ = t.no_error(model:insert_many([
+            {nome = "Ana", email = "a@x.com", saldo = 10.0, endereco = {rua = "R", cidade = "Santos", uf = "SP"}},
+            {nome = "bia", saldo = 20.0, ativo = false, endereco = {rua = "R", cidade = "Rio", uf = "RJ"}},
+        ]))
+        local rows = t.no_error(db:raw("SELECT nome, length(nome) AS n FROM clientes WHERE nome <> ? AND nome <> '?' ORDER BY id", "x"))
+        t.eq(rows, [{nome = "Ana", n = 3}, {nome = "bia", n = 3}])
+        t.eq(t.no_error(db:exec("UPDATE clientes SET nome = upper(nome) WHERE id = ?", 2)), 1)
+
+        -- model:raw hydrates: ativo is a bool, endereco a document
+        local docs = t.no_error(model:raw("SELECT * FROM clientes WHERE ativo = ?", 0))
+        t.eq(len(docs), 1)
+        t.eq(docs[0].nome, "BIA")
+        t.eq(docs[0].ativo, false)
+        t.eq(docs[0].endereco.uf, "RJ")
+
+        rows = t.no_error(model:where("ativo", false):or_where_raw("upper(nome) = ?", "ANA"):order_by("nome"):all())
+        t.eq(len(rows), 2)
+        t.eq(t.no_error(model:where_raw("saldo * 2 > ?", 30):count()), 1)
+
+        local st = t.no_error(rdd.sql.find(Clientes, t.no_error(model:where("nome", "x"):where_raw("tags ?? ?", "vip"):to_plan()),
+            rdd.sql.dialects.postgres))
+        t.eq(st.sql, "SELECT * FROM \"clientes\" WHERE \"nome\" = $1 AND (tags ? $2)")
+
+        t.is_error(db:raw("SELECT ? AS a", 1, 2), "more values than '?'")
+        t.is_error(db:raw("SELECT ? AS a"), "more '?' than values")
+        model.conn.raw = false
+        t.is_error(model:where_raw("1 = 1"):all(), "needs a SQL driver")
+    end)
+
     t.it("saves with upsert and with the lookup fallback", function()
         local function check_save()
             local a = t.no_error(model:save({nome = "Ana", email = "a@x.com", saldo = 1.0}))

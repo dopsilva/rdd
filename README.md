@@ -144,6 +144,28 @@ local sem_pedido = clientes:left_join(Pedidos, "p", "p.cliente_id = id"):where("
 - Um driver que declara `conn.joins = true` recebe `plan.joins` (`[{kind = "inner"|"left", alias, collection, schema, on = [{left, right}]}]`) e faz o join no banco. É o caso do `rdd.sql`, que gera `INNER JOIN`/`LEFT JOIN` com todas as colunas qualificadas.
 - Para os outros drivers, o RDD lê cada tabela com `find`, junta em memória e aplica filtros, ordem, paginação e agregações. Os filtros que tocam só uma tabela seguem para o `find` dela antes do join, para ler menos.
 
+### SQL cru
+
+Quando o construtor de queries não alcança (uma função do banco, um `WITH`, um relatório complexo), há três níveis:
+
+```sea
+-- 1. Um comando inteiro: linhas como o banco devolve, ou o número de linhas alteradas
+local linhas = db:raw("SELECT uf, count(*) AS n FROM clientes GROUP BY uf HAVING count(*) > ?", 10)?
+local n = db:exec("UPDATE clientes SET nome = upper(nome) WHERE id = ?", 7)?
+
+-- 2. Pelo model: cada linha volta como documento do schema (bool, JSON decodificados)
+local vips = clientes:raw("SELECT * FROM clientes WHERE saldo > (SELECT avg(saldo) FROM clientes)")?
+
+-- 3. Um trecho cru dentro de uma query normal, entre parênteses
+local ana = clientes:where("ativo", true):where_raw("lower(nome) = lower(?)", "ANA"):first()?
+```
+
+**Regras:**
+- Os `?` viram o marcador de parâmetro do dialeto (`?`, `$1` ou `@p1`); `??` escreve um `?` literal, por exemplo para o operador `?` do jsonb.
+- Um `?` dentro de aspas não é tocado.
+- O texto cru não é validado pelo schema. Com joins, as colunas vão como o SQL as nomeia (`"p".valor`).
+- Os três níveis precisam de um driver SQL: os dois primeiros usam os métodos `conn:raw_query` e `conn:raw_exec`, e o `where_raw` exige `conn.raw = true`. O `rdd.sql.connection` tem os três.
+
 ### Agregações e paginação
 
 ```sea
