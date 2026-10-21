@@ -182,6 +182,8 @@ M.dialects.sqlserver = M.dialect({
         map = "NVARCHAR(MAX)", document = "NVARCHAR(MAX)", array = "NVARCHAR(MAX)", any = "NVARCHAR(MAX)",
     },
     auto_pk = function(t) return `${t} IDENTITY(1,1) PRIMARY KEY` end,
+    -- MERGE writes the key column: with an IDENTITY key the table needs
+    -- SET IDENTITY_INSERT ON for saves that bring their own id
     upsert = function(qname, cols, phs, key)
         local src = []
         local sets = []

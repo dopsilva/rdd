@@ -303,3 +303,16 @@ local mysql = rdd.sql.dialect({quote = function(n) return "`" .. n .. "`" end})
 ~/projects/sea_vm/bin/sea check *.sea
 ~/projects/sea_vm/bin/sea test -v
 ```
+
+## 5. Exemplos
+
+```sh
+~/projects/sea_vm/bin/sea examples/01_schemas_and_queries.sea
+```
+
+| Exemplo | O que mostra |
+| --- | --- |
+| `01_schemas_and_queries.sea` | Schemas aninhados e validação, sem banco. Também o plano gerado por consultas com expressão, `nil`, erros, join e agregação. |
+| `02_custom_driver_memory.sea` | Um driver de documentos em memória que implementa só o obrigatório e usa `rdd.match`. Join, agregação, `count` e `save` funcionam pelo RDD sobre o `find` dele. |
+| `03_sqlite_driver.sea` | Uma loja (clientes, produtos e pedidos) no SQLite pelo `rdd.sql`, com tudo rodando no banco. Mostra expressões, operadores, dois joins, vendas por categoria, `left join` para quem nunca comprou, upsert, paginação e transação com rollback. |
+| `04_sql_dialects.sea` | O mesmo plano compilado para SQLite, PostgreSQL, SQL Server e um dialeto MySQL escrito no próprio exemplo. |

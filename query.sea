@@ -825,6 +825,7 @@ local function get_path(doc, path)
     end
     return v
 end
+M.get_path = get_path
 
 local function compare(a, b)
     if a == b then return 0 end

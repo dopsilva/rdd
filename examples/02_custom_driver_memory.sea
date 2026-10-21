@@ -7,23 +7,14 @@
 -- documentos/objetos (estilo MongoDB / S3 / Key-Value em memória), onde os
 -- sub-documentos são armazenados nativamente sem achatar tabelas.
 --
+-- O driver implementa só o obrigatório (insert, find, update, delete, close).
+-- O resto vem do RDD: rdd.match avalia os filtros do plano, e joins,
+-- agregações, count e save funcionam sobre o find() do driver.
+--
 -- Execução:
 --   ~/projects/sea_vm/bin/sea examples/02_custom_driver_memory.sea
 
 local rdd = require("../rdd")
-
--- Resolve um caminho "endereco.cidade" dentro de um documento aninhado
-local function get_path(doc, path)
-    local parts = string.split(path, ".")
-    local curr = doc
-    for _, p in parts do
-        if type(curr) ~= "table" and type(curr) ~= "struct" and type(curr) ~= "map" then
-            return nil
-        end
-        curr = curr[p]
-    end
-    return curr
-end
 
 -- Define um valor em um caminho "endereco.cidade" dentro de um documento
 local function set_path(doc, path, val)
@@ -37,53 +28,19 @@ local function set_path(doc, path, val)
     curr[parts[-1]] = val
 end
 
--- Avalia recursivamente os filtros da AST do RDD sobre um documento
-local match_filters
-
-local function match_cond(doc, node)
-    local v = get_path(doc, node.field)
-    local op = node.op
-    local target = node.value
-    if op == "=" then return v == target end
-    if op == "!=" then return v ~= target end
-    if op == "is_null" then return v == nil end
-    if op == "is_not_null" then return v ~= nil end
-    if v == nil then return false end
-    if op == "<" then return v < target end
-    if op == "<=" then return v <= target end
-    if op == ">" then return v > target end
-    if op == ">=" then return v >= target end
-    if op == "between" then return v >= target[0] and v <= target[1] end
-    if op == "in" then return list.contains(target, v) end
-    if op == "not_in" then return not list.contains(target, v) end
-    if op == "contains" then return string.contains(tostring(v), tostring(target)) end
-    if op == "starts_with" then return string.starts_with(tostring(v), tostring(target)) end
-    if op == "ends_with" then return string.ends_with(tostring(v), tostring(target)) end
-    return false
+local function copy(doc)
+    return json.decode(json.encode(doc))
 end
 
-match_filters = function(doc, filters)
-    if len(filters) == 0 then return true end
-    local result = true
-    for i, node in filters do
-        local matched = false
-        if node.kind == "group" then
-            matched = match_filters(doc, node.filters)
-        else
-            matched = match_cond(doc, node)
-        end
-        if i == 0 then
-            result = matched
-        elseif node.logic == "or" then
-            result = result or matched
-        else
-            result = result and matched
-        end
-    end
-    return result
+local function compare(a, b)
+    if a == b then return 0 end
+    if a == nil then return -1 end
+    if b == nil then return 1 end
+    return a < b and -1 or 1
 end
 
--- Registro do driver "memory_doc"
+-- ---- Registro do driver "memory_doc" ----
+
 rdd.register_driver("memory_doc", {
     open = function(_)
         local store = [=]
@@ -102,63 +59,57 @@ rdd.register_driver("memory_doc", {
 
         function conn.insert(_, schema, doc)
             local b = bucket(schema.name)
-            local copy = json.decode(json.encode(doc))
+            local c = copy(doc)
             local pk = schema.primary_key
-            if pk ~= nil and copy[pk] == nil then
+            if pk ~= nil and c[pk] == nil then
                 seq[schema.name] += 1
-                copy[pk] = seq[schema.name]
+                c[pk] = seq[schema.name]
             end
-            b[] = copy
-            return json.decode(json.encode(copy))
+            b[] = c
+            return copy(c)
         end
 
         function conn.find(_, schema, plan)
-            local b = bucket(schema.name)
             local out = []
-            for _, doc in b do
-                if match_filters(doc, plan.filters) then
-                    out[] = json.decode(json.encode(doc))
-                end
+            for _, doc in bucket(schema.name) do
+                -- rdd.match entende todos os operadores e grupos do plano
+                if rdd.match(doc, plan.filters) then out[] = copy(doc) end
             end
-            -- Ordenação
             if len(plan.orders) > 0 then
-                sort.sort(out, function(a, b_doc)
+                sort.sort(out, function(a, b)
                     for _, o in plan.orders do
-                        local va = get_path(a, o.field)
-                        local vb = get_path(b_doc, o.field)
-                        if va ~= vb then
-                            if o.dir == "desc" then return va > vb end
-                            return va < vb
+                        local c = compare(rdd.get_path(a, o.field), rdd.get_path(b, o.field))
+                        if c ~= 0 then
+                            if o.dir == "desc" then return c > 0 end
+                            return c < 0
                         end
                     end
                     return false
                 end)
             end
-            -- Paginação (offset / limit)
             local start = plan.offset or 0
             local stop = len(out)
-            if plan.limit ~= nil and start + plan.limit < stop then
-                stop = start + plan.limit
-            end
+            if plan.limit ~= nil and start + plan.limit < stop then stop = start + plan.limit end
+            if start >= stop then return [] end
             local sliced = list.slice(out, start, stop)
-            -- Projeção de campos (se especificada)
-            if len(plan.fields) > 0 then
-                local projected = []
-                for _, d in sliced do
-                    local p = {}
-                    for _, f in plan.fields do p[f] = get_path(d, f) end
-                    projected[] = p
+            if len(plan.fields) == 0 then return sliced end
+            -- Projeção: um caminho aninhado traz o campo raiz inteiro
+            local projected = []
+            for _, d in sliced do
+                local p = {}
+                for _, f in plan.fields do
+                    local root = string.split(f, ".")[0]
+                    p[root] = d[root]
                 end
-                return projected
+                projected[] = p
             end
-            return sliced
+            return projected
         end
 
         function conn.update(_, schema, plan, changes)
-            local b = bucket(schema.name)
             local updated = 0
-            for _, doc in b do
-                if match_filters(doc, plan.filters) then
+            for _, doc in bucket(schema.name) do
+                if rdd.match(doc, plan.filters) then
                     for k, v in changes do set_path(doc, k, v) end
                     updated += 1
                 end
@@ -167,11 +118,10 @@ rdd.register_driver("memory_doc", {
         end
 
         function conn.delete(_, schema, plan)
-            local b = bucket(schema.name)
             local kept = []
             local deleted = 0
-            for _, doc in b do
-                if match_filters(doc, plan.filters) then
+            for _, doc in bucket(schema.name) do
+                if rdd.match(doc, plan.filters) then
                     deleted += 1
                 else
                     kept[] = doc
@@ -194,6 +144,7 @@ rdd.register_driver("memory_doc", {
 local Clientes = rdd.schema("clientes", {
     id = {type = "int", primary_key = true, auto = true},
     nome = {type = "string", required = true},
+    email = "string",
     ativo = {type = "bool", default_val = true},
     saldo = {type = "number", default_val = 0.0},
     endereco = {
@@ -202,16 +153,31 @@ local Clientes = rdd.schema("clientes", {
     },
 })
 
+local Pedidos = rdd.schema("pedidos", {
+    id = {type = "int", primary_key = true, auto = true},
+    cliente_id = {type = "int", required = true},
+    produto = {type = "string", required = true},
+    valor = {type = "number", required = true},
+})
+
 local function main()
     local db = rdd.open("memory_doc")?
     defer db:close()
 
     local clientes = db:model(Clientes)
+    local pedidos = db:model(Pedidos)
 
     local _ = clientes:insert_many([
-        {nome = "Ana", saldo = 1200.0, endereco = {cidade = "São Paulo", uf = "SP"}},
+        {nome = "Ana", email = "ana@example.com", saldo = 1200.0, endereco = {cidade = "São Paulo", uf = "SP"}},
         {nome = "Carlos", saldo = 450.0, endereco = {cidade = "Curitiba", uf = "PR"}},
-        {nome = "Beatriz", saldo = 3100.0, endereco = {cidade = "Campinas", uf = "SP"}},
+        {nome = "Beatriz", email = "bia@example.com", saldo = 3100.0, endereco = {cidade = "Campinas", uf = "SP"}},
+        {nome = "Diego", email = "diego@example.com", saldo = 80.0, ativo = false, endereco = {cidade = "Recife", uf = "PE"}},
+    ])?
+    _ = pedidos:insert_many([
+        {cliente_id = 1, produto = "Teclado", valor = 450.0},
+        {cliente_id = 3, produto = "Monitor 4K", valor = 2200.0},
+        {cliente_id = 3, produto = "Mouse", valor = 300.0},
+        {cliente_id = 2, produto = "Cabo HDMI", valor = 40.0},
     ])?
 
     print("=== Clientes de SP ordenados por maior saldo ===")
@@ -220,17 +186,49 @@ local function main()
         printf("  #%d %s (%s/%s) - R$ %.2f\n", c.id, c.nome, c.endereco.cidade, c.endereco.uf, c.saldo)
     end
 
+    print("\n=== Condição como expressão: (SP ou PR) e ativo, com e-mail ===")
+    local filtrados = clientes:where("(endereco.uf = ? or endereco.uf = ?) and ativo = ?", "SP", "PR", true)
+        :where("email", "!=", nil)
+        :order_by("nome")
+        :all()?
+    for _, c in filtrados do printf("  %s <%s>\n", c.nome, c.email) end
+
+    print("\n=== Sem e-mail (where com nil vira is_null) ===")
+    for _, c in clientes:where("email", nil):all()? do printf("  %s\n", c.nome) end
+
     -- Atualizando sub-documento via dot-notation
-    local _ = clientes:where("nome", "Carlos"):update({
+    _ = clientes:where("nome", "Carlos"):update({
         saldo = 900.0,
         ["endereco.cidade"] = "Londrina",
     })?
-
     local carlos = clientes:where("nome", "Carlos"):first()?
     printf("\nApós update -> %s agora mora em %s/%s com saldo R$ %.2f\n",
         carlos.nome, carlos.endereco.cidade, carlos.endereco.uf, carlos.saldo)
 
-    -- Agregações: este driver não tem aggregate(), então o RDD agrupa em memória
+    -- save(): com id existente atualiza; sem id insere
+    _ = clientes:save({id = 4, nome = "Diego", saldo = 150.0, ativo = true, endereco = {cidade = "Olinda", uf = "PE"}})?
+    local diego = clientes:find(4)?
+    printf("save() -> %s agora em %s, ativo = %s\n", diego.nome, diego.endereco.cidade, tostring(diego.ativo))
+
+    -- Joins: o driver não sabe fazer join, então o RDD junta em memória
+    print("\n=== Pedidos com o nome do cliente (join) ===")
+    local itens = pedidos:join(Clientes, "c", "c.id = cliente_id")
+        :where("valor", ">=", 100)
+        :order_by("-valor")
+        :all()?
+    for _, p in itens do printf("  %-12s R$ %8.2f  %s (%s)\n", p.produto, p.valor, p.c.nome, p.c.endereco.uf) end
+
+    print("\n=== Total comprado por cliente (left join + agregação) ===")
+    local vendas = clientes:left_join(Pedidos, "p", "p.cliente_id = id")
+        :group_by("nome")
+        :aggregate({pedidos = "count(p.id)", total = "sum(p.valor)"})
+        :order_by("-total")
+        :all()?
+    for _, r in vendas do
+        printf("  %-8s %d pedido(s)  R$ %8.2f\n", r.nome, r.pedidos, r.total or 0.0)
+    end
+
+    -- Agregações sem join: também calculadas pelo RDD sobre o find()
     print("\n=== Saldo por UF ===")
     local por_uf = clientes:group_by("endereco.uf")
         :aggregate({n = "count(*)", total = "sum(saldo)"})
@@ -239,7 +237,7 @@ local function main()
     for _, r in por_uf do
         printf("  %s: %d cliente(s), R$ %.2f\n", r["endereco.uf"], r.n, r.total)
     end
-    printf("Saldo total: R$ %.2f\n", clientes:sum("saldo")?)
+    printf("Saldo total: R$ %.2f | maior saldo: R$ %.2f\n", clientes:sum("saldo")?, clientes:max("saldo")?)
 
     local pagina = clientes:order_by("nome"):paginate(1, 2)?
     printf("Página %d de %d (%d clientes): %s, %s\n", pagina.page, pagina.pages, pagina.total,

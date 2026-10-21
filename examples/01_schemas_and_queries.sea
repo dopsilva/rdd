@@ -63,16 +63,53 @@ if is_error(invalido) then
     print("Erro capturado:", invalido.message)
 end
 
-print("\n=== 3. Gerando o Query Plan (AST) abstrato para drivers ===")
-local query = rdd.query(Clientes):fields("id", "nome", "saldo", "endereco.cidade"):where("ativo", true):where("saldo", ">=", 500):where("endereco.uf", "SP"):or_where(function(sub)
-    sub:where("endereco.uf", "RJ"):where_in("tags", ["vip", "ouro"])
-end):order_by("-saldo"):order_by("nome", "asc"):limit(10):offset(0)
-
-local plan = query:to_plan()
-if is_error(plan) then
-    panic(plan.message)
+-- Mostra um plano sem os schemas (que são grandes) para ficar legível
+local function show(query)
+    local plan = query:to_plan()
+    if is_error(plan) then panic(plan.message) end
+    plan.schema = `<Schema:${plan.schema.name}>`
+    for _, j in plan.joins or [] do j.schema = `<Schema:${j.schema.name}>` end
+    dump(plan)
 end
 
--- Remove a referência circular visual do schema apenas para exibir o plano limpo
-plan.schema = `<Schema:${plan.schema.name}>`
-dump(plan)
+print("\n=== 3. Gerando o Query Plan (AST) abstrato para drivers ===")
+show(rdd.query(Clientes)
+    :fields("id", "nome", "saldo", "endereco.cidade")
+    :where("ativo", true)
+    :where("saldo", ">=", 500)
+    :where("endereco.uf", "SP")
+    :or_where(function(sub)
+        sub:where("endereco.uf", "RJ"):where_in("tags", ["vip", "ouro"])
+    end)
+    :order_by("-saldo")
+    :order_by("nome", "asc")
+    :limit(10)
+    :offset(0))
+
+-- A mesma ideia escrita como expressão. and liga mais forte que or, como no
+-- SQL, e o plano deixa os grupos explícitos.
+print("\n=== 4. Condição como expressão (valores sempre como ?) ===")
+show(rdd.query(Clientes)
+    :where("ativo = ? and (endereco.uf = 'SP' or endereco.uf = ?) and saldo between ? and ?", true, "RJ", 500, 5000)
+    :where("email", nil)) -- nil vira is_null
+
+print("\n=== 5. Erros (campo desconhecido, ? sem valor, parêntese aberto) voltam no plano ===")
+print(rdd.query(Clientes):where("(nome = ? or apelido = ?)", "Ana", "Aninha"):to_plan())
+print(rdd.query(Clientes):where("nome = ? and saldo > ?", "Ana"):to_plan())
+print(rdd.query(Clientes):where("(nome = ?", "Ana"):to_plan())
+
+local Pedidos = rdd.schema("pedidos", {
+    id = {type = "int", primary_key = true, auto = true},
+    cliente_id = {type = "uuid", required = true},
+    produto = {type = "string", required = true},
+    valor = {type = "number", required = true},
+})
+
+print("\n=== 6. Join e agregação: total por cliente de SP ===")
+show(rdd.query(Clientes)
+    :left_join(Pedidos, "p", "p.cliente_id = id")
+    :where("endereco.uf", "SP")
+    :group_by("nome")
+    :aggregate({pedidos = "count(p.id)", total = "sum(p.valor)"})
+    :order_by("-total")
+    :limit(5))

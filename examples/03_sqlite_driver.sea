@@ -1,11 +1,12 @@
 -- Copyright (c) 2026 The Sea Authors
 -- SPDX-License-Identifier: BSD-3-Clause
 
--- 03_sqlite_driver.sea — O mesmo modelo e queries rodando sobre SQLite
+-- 03_sqlite_driver.sea — Uma loja (clientes e pedidos) sobre SQLite
 --
--- Demonstra como a aplicação mantém exatamente a mesma definição de Schema
--- (incluindo documentos aninhados e arrays) e a mesma API de queries fluentes,
--- trocando apenas o driver registrado para SQLite.
+-- A aplicação usa a mesma definição de Schema (com documentos aninhados e
+-- arrays) e a mesma API de queries dos outros exemplos; só o driver
+-- registrado muda. Aqui tudo roda no banco: filtros, joins, agregações,
+-- paginação e o upsert do save().
 --
 -- Execução:
 --   ~/projects/sea_vm/bin/sea examples/03_sqlite_driver.sea
@@ -15,11 +16,10 @@ local rdd = require("../rdd")
 
 -- ---- Driver SQLite para o RDD ----
 --
--- O rdd.sql compila os planos de query em SQL parametrizado (WHERE com
--- grupos, in, between, is null, contains..., ORDER BY, LIMIT/OFFSET, INSERT,
--- UPDATE em campos aninhados, CREATE TABLE). O driver só liga o banco a ele.
--- Para PostgreSQL ou SQL Server, troque o dialeto (rdd.sql.dialects.postgres,
--- rdd.sql.dialects.sqlserver) e o objeto de conexão.
+-- O rdd.sql compila os planos de query em SQL parametrizado e
+-- rdd.sql.connection implementa o contrato do driver sobre o handle do
+-- sqlite. Para PostgreSQL ou SQL Server, troque o dialeto
+-- (rdd.sql.dialects.postgres, rdd.sql.dialects.sqlserver) e o handle.
 
 rdd.register_driver("sqlite", {
     open = function(opts)
@@ -28,75 +28,165 @@ rdd.register_driver("sqlite", {
     end,
 })
 
--- ---- Código da aplicação (idêntico ao exemplo 02!) ----
+-- ---- Schemas ----
 
 local Clientes = rdd.schema("clientes", {
     id = {type = "int", primary_key = true, auto = true},
     nome = {type = "string", required = true},
+    email = {type = "string", unique = true},
     ativo = {type = "bool", default_val = true},
     saldo = {type = "number", default_val = 0.0},
     endereco = {
         cidade = {type = "string", required = true},
         uf = {type = "string", default_val = "SP"},
     },
-    pedidos = {
-        type = "array",
-        items = {
-            produto = "string",
-            valor = "number",
-        },
-    },
+    tags = {type = "array", items = "string"},
 })
+
+local Produtos = rdd.schema("produtos", {
+    id = {type = "int", primary_key = true, auto = true},
+    nome = {type = "string", required = true},
+    categoria = {type = "string", required = true},
+    preco = {type = "number", required = true},
+})
+
+local Pedidos = rdd.schema("pedidos", {
+    id = {type = "int", primary_key = true, auto = true},
+    cliente_id = {type = "int", required = true},
+    produto_id = {type = "int", required = true},
+    quantidade = {type = "int", default_val = 1},
+    total = {type = "number", required = true},
+    pago = {type = "bool", default_val = false},
+})
+
+-- printf conta bytes; pad completa pela contagem de caracteres (utf8)
+local function pad(s, n)
+    return s .. string.rep(" ", math.max(0, n - utf8.len(s)))
+end
+
+local function section(title)
+    print(`\n=== ${title} ===`)
+end
 
 local function main()
     local db = rdd.open("sqlite", {path = ":memory:"})?
     defer db:close()
 
-    local _ = db:migrate(Clientes)?
+    local _ = db:migrate(Clientes, Produtos, Pedidos)?
     local clientes = db:model(Clientes)
+    local produtos = db:model(Produtos)
+    local pedidos = db:model(Pedidos)
 
-    local _ = clientes:insert_many([
-        {
-            nome = "Ana",
-            saldo = 1200.0,
-            endereco = {cidade = "São Paulo", uf = "SP"},
-            pedidos = [{produto = "Teclado Mecânico", valor = 450.0}],
-        },
-        {
-            nome = "Carlos",
-            saldo = 450.0,
-            endereco = {cidade = "Curitiba", uf = "PR"},
-            pedidos = [],
-        },
-        {
-            nome = "Beatriz",
-            saldo = 3100.0,
-            endereco = {cidade = "Campinas", uf = "SP"},
-            pedidos = [
-                {produto = "Monitor 4K", valor = 2200.0},
-                {produto = "Mouse", valor = 300.0},
-            ],
-        },
+    _ = clientes:insert_many([
+        {nome = "Ana", email = "ana@example.com", saldo = 1200.0, endereco = {cidade = "São Paulo", uf = "SP"}, tags = ["vip"]},
+        {nome = "Carlos", saldo = 450.0, endereco = {cidade = "Curitiba", uf = "PR"}, tags = []},
+        {nome = "Beatriz", email = "bia@example.com", saldo = 3100.0, endereco = {cidade = "Campinas", uf = "SP"}, tags = ["vip", "atacado"]},
+        {nome = "Diego", email = "diego@example.com", saldo = 80.0, ativo = false, endereco = {cidade = "Recife", uf = "PE"}},
+        {nome = "Elisa", email = "elisa@example.com", saldo = 640.0, endereco = {cidade = "Niterói", uf = "RJ"}},
+    ])?
+    _ = produtos:insert_many([
+        {nome = "Teclado Mecânico", categoria = "periféricos", preco = 450.0},
+        {nome = "Monitor 4K", categoria = "monitores", preco = 2200.0},
+        {nome = "Mouse 50% off", categoria = "periféricos", preco = 150.0},
+        {nome = "Cabo HDMI", categoria = "cabos", preco = 40.0},
+    ])?
+    _ = pedidos:insert_many([
+        {cliente_id = 1, produto_id = 1, total = 450.0, pago = true},
+        {cliente_id = 3, produto_id = 2, total = 2200.0, pago = true},
+        {cliente_id = 3, produto_id = 3, quantidade = 2, total = 300.0},
+        {cliente_id = 2, produto_id = 4, quantidade = 3, total = 120.0, pago = true},
+        {cliente_id = 5, produto_id = 3, total = 150.0},
     ])?
 
-    print("=== [SQLite] Clientes de SP ordenados por maior saldo ===")
-    local paulistas = clientes:where("endereco.uf", "SP"):order_by("-saldo"):all()?
-    for _, c in paulistas do
-        printf("  #%d %s (%s/%s) - Saldo: R$ %.2f - Pedidos: %d\n",
-            c.id, c.nome, c.endereco.cidade, c.endereco.uf, c.saldo, len(c.pedidos))
+    section("Clientes de SP ordenados por maior saldo")
+    for _, c in clientes:where("endereco.uf", "SP"):order_by("-saldo"):all()? do
+        printf("  #%d %s (%s/%s) - R$ %.2f - tags: %s\n",
+            c.id, c.nome, c.endereco.cidade, c.endereco.uf, c.saldo, string.join(c.tags or [], ", "))
     end
 
-    -- Transferência dentro de uma transação
-    local _ = db:transaction(function(tx)
+    section("Expressão: (SP ou RJ) e saldo acima de 500, ou inativos")
+    local q = clientes:where("(endereco.uf = ? or endereco.uf = ?) and saldo > ? or ativo = ?", "SP", "RJ", 500, false)
+        :order_by("nome")
+    -- o SQL que o rdd.sql gera para essa query
+    local st = rdd.sql.find(Clientes, q:to_plan()?, rdd.sql.dialects.sqlite)?
+    printf("  SQL: %s\n  params: %s\n", st.sql, json.encode(st.params))
+    for _, c in q:all()? do printf("  %s (%s, R$ %.2f)\n", c.nome, c.endereco.uf, c.saldo) end
+
+    section("Operadores")
+    local function nomes(query)
+        local out = []
+        for _, r in query:order_by("nome"):all()? do out[] = r.nome end
+        return string.join(out, ", ")
+    end
+    printf("  in [PR, PE]:             %s\n", nomes(clientes:where_in("endereco.uf", ["PR", "PE"])))
+    printf("  saldo between 400..1500: %s\n", nomes(clientes:where_between("saldo", 400, 1500)))
+    printf("  sem e-mail (nil):        %s\n", nomes(clientes:where("email", nil)))
+    printf("  nome ilike 'b%%':         %s\n", nomes(clientes:where("nome", "ilike", "b%")))
+    -- contains escapa o % do valor: só casa com o texto "50%"
+    printf("  produto contém '50%%':    %s\n", nomes(produtos:where("nome", "contains", "50%")))
+
+    section("Pedidos com cliente e produto (dois joins)")
+    local itens = pedidos:join(Clientes, "c", "c.id = cliente_id")
+        :join(Produtos, "p", "p.id = produto_id")
+        :where("p.categoria", "!=", "cabos")
+        :order_by("-total")
+        :all()?
+    for _, i in itens do
+        printf("  %s %s %dx  R$ %8.2f  %s\n", pad(i.c.nome, 8), pad(i.p.nome, 18), i.quantidade, i.total, i.pago and "pago" or "em aberto")
+    end
+
+    section("Vendas por categoria (join + agregação no banco)")
+    local por_categoria = pedidos:join(Produtos, "p", "p.id = produto_id")
+        :group_by("p.categoria")
+        :aggregate({itens = "sum(quantidade)", receita = "sum(total)", ticket = "avg(total)"})
+        :order_by("-receita")
+        :all()?
+    for _, r in por_categoria do
+        printf("  %s %d item(ns)  R$ %8.2f  (ticket médio R$ %.2f)\n", pad(r["p.categoria"], 12), r.itens, r.receita, r.ticket)
+    end
+
+    section("Total comprado por cliente (left join mantém quem não comprou)")
+    local por_cliente = clientes:left_join(Pedidos, "o", "o.cliente_id = id")
+        :group_by("nome")
+        :aggregate({pedidos = "count(o.id)", gasto = "sum(o.total)"})
+        :order_by("-gasto")
+        :order_by("nome")
+        :all()?
+    for _, r in por_cliente do printf("  %-8s %d pedido(s)  R$ %8.2f\n", r.nome, r.pedidos, r.gasto or 0.0) end
+
+    local nunca = clientes:left_join(Pedidos, "o", "o.cliente_id = id"):where("o.id", nil):fields("nome"):all()?
+    printf("  nunca compraram: %s\n", nunca[0].nome)
+    printf("  a receber: R$ %.2f\n", pedidos:where("pago", false):sum("total")?)
+
+    section("save(): upsert pela chave primária")
+    _ = clientes:save({id = 2, nome = "Carlos", saldo = 990.0, endereco = {cidade = "Londrina", uf = "PR"}})?
+    _ = clientes:save({nome = "Fábio", email = "fabio@example.com", endereco = {cidade = "Manaus", uf = "AM"}})?
+    local carlos = clientes:find(2)?
+    printf("  Carlos -> %s/%s, R$ %.2f; total de clientes: %d\n",
+        carlos.endereco.cidade, carlos.endereco.uf, carlos.saldo, clientes:count()?)
+
+    section("Paginação")
+    for page = 1, 3 do
+        local pg = clientes:order_by("nome"):paginate(page, 2)?
+        local names = []
+        for _, c in pg.items do names[] = c.nome end
+        printf("  página %d/%d (%d clientes): %s\n", pg.page, pg.pages, pg.total, string.join(names, ", "))
+    end
+
+    section("Transação")
+    _ = db:transaction(function(tx)
         local tx_c = tx:model(Clientes)
         local _ = tx_c:where("nome", "Beatriz"):update({saldo = 2600.0})?
-        local _ = tx_c:where("nome", "Carlos"):update({saldo = 950.0})?
+        local _ = tx_c:where("nome", "Carlos"):update({saldo = 1490.0, ["endereco.cidade"] = "Maringá"})?
         return true
     end)?
-
-    local carlos = clientes:where("nome", "Carlos"):first()?
+    local falhou = db:transaction(function(tx)
+        local _ = tx:model(Clientes):where("nome", "Ana"):update({saldo = 0.0})?
+        return error("estorno recusado")
+    end)
+    local ana = clientes:where("nome", "Ana"):first()?
     local beatriz = clientes:where("nome", "Beatriz"):first()?
-    printf("\nApós transação -> Beatriz: R$ %.2f | Carlos: R$ %.2f\n", beatriz.saldo, carlos.saldo)
+    printf("  Beatriz: R$ %.2f | Ana continua com R$ %.2f (%s)\n", beatriz.saldo, ana.saldo, falhou.message)
 end
 
 local err = main()

@@ -1,0 +1,102 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- 04_sql_dialects.sea — A mesma query em SQLite, PostgreSQL e SQL Server
+--
+-- O rdd.sql compila um plano de query em SQL parametrizado. O que muda de um
+-- banco para outro (marcador dos parâmetros, aspas, JSON, paginação, ILIKE,
+-- upsert, tipos de coluna) fica no dialeto. Nenhum banco é aberto aqui: o
+-- exemplo só mostra o SQL que cada driver executaria.
+--
+-- Execução:
+--   ~/projects/sea_vm/bin/sea examples/04_sql_dialects.sea
+
+local rdd = require("../rdd")
+local sql = rdd.sql
+
+local Clientes = rdd.schema("clientes", {
+    id = {type = "int", primary_key = true, auto = true},
+    nome = {type = "string", required = true},
+    ativo = {type = "bool", default_val = true},
+    saldo = {type = "number", default_val = 0.0},
+    endereco = {
+        cidade = "string",
+        uf = "string",
+    },
+})
+
+local Pedidos = rdd.schema("pedidos", {
+    id = {type = "int", primary_key = true, auto = true},
+    cliente_id = {type = "int", required = true},
+    valor = {type = "number", required = true},
+})
+
+-- Um dialeto próprio: MySQL usa crases e não tem RETURNING nem ILIKE
+local mysql = sql.dialect({
+    name = "mysql",
+    quote = function(n) return "`" .. string.replace(n, "`", "``") .. "`" end,
+    json_get = function(col, parts) return `JSON_UNQUOTE(JSON_EXTRACT(${col}, '$.${string.join(parts, ".")}'))` end,
+    auto_pk = function(t) return `${t} PRIMARY KEY AUTO_INCREMENT` end,
+    upsert = function(qname, cols, phs, key)
+        local sets = []
+        for _, c in cols do
+            if c ~= key then sets[] = `${c} = VALUES(${c})` end
+        end
+        return `INSERT INTO ${qname} (${string.join(cols, ", ")}) VALUES (${string.join(phs, ", ")})` ..
+            ` ON DUPLICATE KEY UPDATE ${string.join(sets, ", ")}`
+    end,
+})
+
+local DIALECTS = [
+    ["sqlite", sql.dialects.sqlite],
+    ["postgres", sql.dialects.postgres],
+    ["sqlserver", sql.dialects.sqlserver],
+    ["mysql", mysql],
+]
+
+local function show(title, build)
+    print(`\n=== ${title} ===`)
+    for _, pair in DIALECTS do
+        local st = build(pair[1])
+        if is_error(st) then panic(st.message) end
+        if type(st) == "string" then
+            printf("%-9s %s\n", pair[0], st)
+        else
+            printf("%-9s %s\n%-9s params %s\n", pair[0], st.sql, "", json.encode(st.params))
+        end
+    end
+end
+
+-- O exemplo "AND (A.CAMPO = 'A' OR A.CAMPO2 = 'B') AND A.CAMPO3 = 'C'":
+-- os valores viram parâmetros e os campos são validados pelo schema
+local busca = rdd.query(Clientes)
+    :where("ativo", true)
+    :where("(endereco.uf = ? or endereco.cidade = ?) and nome ilike ?", "SP", "Curitiba", "a%")
+    :order_by("-saldo")
+    :limit(10)
+    :offset(20)
+    :to_plan()?
+
+show("Busca com expressão, ILIKE e paginação", function(d) return sql.find(Clientes, busca, d) end)
+show("Contagem da mesma busca (respeita limit/offset)", function(d) return sql.count(Clientes, busca, d) end)
+
+local vendas = rdd.query(Clientes)
+    :join(Pedidos, "p", "p.cliente_id = id")
+    :where("p.valor", ">", 100)
+    :group_by("endereco.uf")
+    :aggregate({clientes = "count(id)", total = "sum(p.valor)"})
+    :order_by("-total")
+    :to_plan()?
+
+show("Join com agregação", function(d) return sql.aggregate(Clientes, vendas, d) end)
+
+local alvo = rdd.query(Clientes):where("nome", "contains", "50%"):to_plan()?
+show("Atualização de um campo dentro do documento", function(d)
+    return sql.update(Clientes, alvo, {saldo = 10.0, ["endereco.cidade"] = "Santos"}, d)
+end)
+
+show("save() com chave: upsert", function(d)
+    return sql.upsert(Clientes, {id = 7, nome = "Ana", ativo = true, saldo = 1.5}, d)
+end)
+
+show("CREATE TABLE", function(d) return sql.create_table(Clientes, d) end)

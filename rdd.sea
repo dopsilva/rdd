@@ -39,6 +39,11 @@ M.query = query_mod.new
 -- SQL compiler for drivers of SQL engines (see sql.sea)
 M.sql = require("./sql")
 
+-- For drivers that filter in memory: rdd.match(doc, plan.filters) → bool,
+-- and rdd.get_path(doc, "endereco.uf")
+M.match = query_mod.match
+M.get_path = query_mod.get_path
+
 -- ---- Model (Schema bound to a Session) ----
 
 local function new_model(session, sch)
