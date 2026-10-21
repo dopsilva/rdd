@@ -1,0 +1,505 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- sql — compiles RDD query plans into parameterized SQL
+--
+-- Every SQL driver needs the same translation: plan filters into a WHERE
+-- clause, orders, limit/offset, the INSERT/UPDATE/DELETE statements and a
+-- CREATE TABLE from the schema. This module does it once; a dialect holds
+-- what differs between engines (placeholders, identifier quoting, JSON paths
+-- into document columns, ILIKE, paging, column types, how bools bind).
+--
+--   local sql = require("rdd/sql")         -- also rdd.sql
+--   local d = sql.dialects.sqlite           -- or postgres, sqlserver, sql.dialect({...})
+--   local st = sql.find(schema, plan, d)?    -- {sql = "...", params = [...]}
+--   local rows = db:query(st.sql, st.params)?
+--   for i, r in rows do rows[i] = sql.hydrate(schema, r, plan.fields, d) end
+--
+-- Values always travel as parameters. Identifiers come from the schema and
+-- are quoted; LIKE patterns built by contains/starts_with/ends_with escape
+-- their own % and _.
+
+local M = {}
+
+local function is_record(v)
+    local t = type(v)
+    return t == "table" or t == "struct" or t == "map" or t == "array"
+end
+
+-- ---- Dialects ----
+
+local function quote_with(open, close)
+    return function(name)
+        return open .. string.replace(name, close, close .. close) .. close
+    end
+end
+
+local function sql_string(s)
+    return "'" .. string.replace(s, "'", "''") .. "'"
+end
+
+local BASE = {
+    name = "sql",
+    placeholder = function(n) return "?" end,
+    quote = quote_with("\"", "\""),
+    has_ilike = false,
+    -- bind(value, field) → the value handed to the database driver
+    bind = function(v, f)
+        if type(v) == "bool" then return v and 1 or 0 end
+        if is_record(v) then return json.encode(v) end
+        return v
+    end,
+    -- read(value, field) → the value put back into the document
+    read = function(v, f)
+        if v == nil or f == nil then return v end
+        if f.type == "bool" and type(v) ~= "bool" then return v == 1 or v == "1" or v == "t" or v == "true" end
+        if (f.type == "document" or f.type == "array" or f.type == "map") and type(v) == "string" then
+            return json.decode(v)
+        end
+        return v
+    end,
+    -- json_get(column_sql, parts) → SQL reading a nested value as text
+    json_get = function(col, parts)
+        return `json_extract(${col}, ${sql_string("$." .. string.join(parts, "."))})`
+    end,
+    -- json_set(column_sql, parts, ph, value) → SQL for the new column value
+    json_set = function(col, parts, ph, v)
+        local arg = is_record(v) and `json(${ph})` or ph
+        return `json_set(COALESCE(${col}, '{}'), ${sql_string("$." .. string.join(parts, "."))}, ${arg})`
+    end,
+    -- paging(sql, limit, offset, has_order) → sql with the limit/offset applied
+    paging = function(s, limit, offset, has_order)
+        if limit ~= nil then s ..= ` LIMIT ${limit}` end
+        if offset ~= nil then
+            if limit == nil then s ..= " LIMIT -1" end
+            s ..= ` OFFSET ${offset}`
+        end
+        return s
+    end,
+    types = {
+        string = "TEXT", int = "INTEGER", number = "REAL", bool = "INTEGER",
+        bytes = "BLOB", time = "TEXT", uuid = "TEXT", any = "TEXT",
+        map = "TEXT", document = "TEXT", array = "TEXT",
+    },
+    -- auto_pk(column_type) → column definition tail for an auto-increment int key
+    auto_pk = function(t) return `${t} PRIMARY KEY AUTOINCREMENT` end,
+    -- returning: INSERT ... RETURNING <pk> gives the generated key
+    returning = false,
+    -- create_table(quoted_name, name, columns_sql) → CREATE TABLE that skips an existing table
+    create_table = function(qname, name, cols)
+        return `CREATE TABLE IF NOT EXISTS ${qname} (${cols})`
+    end,
+}
+
+-- sql.dialect(overrides [, base]) → dialect (missing entries come from base,
+-- the generic SQLite-like dialect by default)
+function M.dialect(over, base)
+    base = base or BASE
+    local d = {}
+    for k, v in base do d[k] = v end
+    local types = {}
+    for k, v in base.types do types[k] = v end
+    for k, v in over or {} do
+        if k == "types" then
+            for tk, tv in v do types[tk] = tv end
+        else
+            d[k] = v
+        end
+    end
+    d.types = types
+    return d
+end
+
+M.dialects = {}
+
+M.dialects.sqlite = M.dialect({name = "sqlite"})
+
+M.dialects.postgres = M.dialect({
+    name = "postgres",
+    placeholder = function(n) return `$${n}` end,
+    has_ilike = true,
+    bind = function(v, f)
+        if is_record(v) then return json.encode(v) end
+        return v
+    end,
+    json_get = function(col, parts)
+        return `${col} #>> ${sql_string("{" .. string.join(parts, ",") .. "}")}`
+    end,
+    json_set = function(col, parts, ph, v)
+        local path = sql_string("{" .. string.join(parts, ",") .. "}")
+        return `jsonb_set(COALESCE(${col}, '{}'::jsonb), ${path}, ${ph}::jsonb)`
+    end,
+    -- json_value(v) → how a value set inside a document column is bound
+    json_value = function(v) return json.encode(v) end,
+    paging = function(s, limit, offset, has_order)
+        if limit ~= nil then s ..= ` LIMIT ${limit}` end
+        if offset ~= nil then s ..= ` OFFSET ${offset}` end
+        return s
+    end,
+    types = {
+        int = "BIGINT", number = "DOUBLE PRECISION", bool = "BOOLEAN",
+        bytes = "BYTEA", time = "TIMESTAMPTZ", uuid = "UUID",
+        map = "JSONB", document = "JSONB", array = "JSONB", any = "JSONB",
+    },
+    auto_pk = function(t) return "BIGSERIAL PRIMARY KEY" end,
+    returning = true,
+})
+
+M.dialects.sqlserver = M.dialect({
+    name = "sqlserver",
+    placeholder = function(n) return `@p${n}` end,
+    quote = quote_with("[", "]"),
+    json_get = function(col, parts)
+        return `JSON_VALUE(${col}, ${sql_string("$." .. string.join(parts, "."))})`
+    end,
+    json_set = function(col, parts, ph, v)
+        local arg = is_record(v) and `JSON_QUERY(${ph})` or ph
+        return `JSON_MODIFY(COALESCE(${col}, '{}'), ${sql_string("$." .. string.join(parts, "."))}, ${arg})`
+    end,
+    -- OFFSET/FETCH needs an ORDER BY
+    paging = function(s, limit, offset, has_order)
+        if limit == nil and offset == nil then return s end
+        if not has_order then s ..= " ORDER BY (SELECT NULL)" end
+        s ..= ` OFFSET ${offset or 0} ROWS`
+        if limit ~= nil then s ..= ` FETCH NEXT ${limit} ROWS ONLY` end
+        return s
+    end,
+    types = {
+        string = "NVARCHAR(MAX)", int = "BIGINT", number = "FLOAT", bool = "BIT",
+        bytes = "VARBINARY(MAX)", time = "DATETIMEOFFSET", uuid = "UNIQUEIDENTIFIER",
+        map = "NVARCHAR(MAX)", document = "NVARCHAR(MAX)", array = "NVARCHAR(MAX)", any = "NVARCHAR(MAX)",
+    },
+    auto_pk = function(t) return `${t} IDENTITY(1,1) PRIMARY KEY` end,
+    create_table = function(qname, name, cols)
+        return `IF OBJECT_ID(${"N" .. sql_string(name)}, N'U') IS NULL CREATE TABLE ${qname} (${cols})`
+    end,
+})
+
+-- ---- Building blocks ----
+
+-- A statement under construction: the parameters and their placeholders.
+local function new_params(d)
+    return {d = d, values = []}
+end
+
+local function add_param(p, v, f)
+    p.values[] = p.d.bind(v, f)
+    return p.d.placeholder(len(p.values))
+end
+
+-- sql.column(schema, path, d) → SQL for a field path ("nome", "endereco.uf")
+function M.column(schema, path, d)
+    local parts = string.split(path, ".")
+    local col = d.quote(parts[0])
+    if len(parts) == 1 then return col end
+    return d.json_get(col, list.slice(parts, 1))
+end
+
+local function field_of(schema, path)
+    if schema == nil then return nil end
+    return schema:field_at(path)
+end
+
+local function like_escape(s)
+    s = string.replace(s, "\\", "\\\\")
+    s = string.replace(s, "%", "\\%")
+    return string.replace(s, "_", "\\_")
+end
+
+local CMP = {["="] = "=", ["=="] = "=", ["!="] = "<>", ["<>"] = "<>", ["<"] = "<", ["<="] = "<=", [">"] = ">", [">="] = ">="}
+
+local function compile_cond(schema, node, p)
+    local d = p.d
+    local col = M.column(schema, node.field, d)
+    local f = field_of(schema, node.field)
+    local op = node.op
+    local v = node.value
+    if CMP[op] ~= nil then
+        if v == nil then
+            return (CMP[op] == "=") and `${col} IS NULL` or `${col} IS NOT NULL`
+        end
+        return `${col} ${CMP[op]} ${add_param(p, v, f)}`
+    elseif op == "is_null" then
+        return `${col} IS NULL`
+    elseif op == "is_not_null" then
+        return `${col} IS NOT NULL`
+    elseif op == "in" or op == "not_in" then
+        if len(v) == 0 then return (op == "in") and "1 = 0" or "1 = 1" end
+        local ph = []
+        for _, item in v do ph[] = add_param(p, item, f) end
+        return `${col} ${(op == "in") and "IN" or "NOT IN"} (${string.join(ph, ", ")})`
+    elseif op == "between" then
+        local lo = add_param(p, v[0], f)
+        return `${col} BETWEEN ${lo} AND ${add_param(p, v[1], f)}`
+    elseif op == "like" then
+        return `${col} LIKE ${add_param(p, v, f)}`
+    elseif op == "ilike" then
+        if d.has_ilike then return `${col} ILIKE ${add_param(p, v, f)}` end
+        return `LOWER(${col}) LIKE LOWER(${add_param(p, v, f)})`
+    elseif op == "contains" or op == "starts_with" or op == "ends_with" then
+        local s = like_escape(tostring(v))
+        if op ~= "starts_with" then s = "%" .. s end
+        if op ~= "ends_with" then s ..= "%" end
+        return `${col} LIKE ${add_param(p, s, nil)} ESCAPE '\\'`
+    end
+    return error(`rdd/sql: operator '${tostring(op)}' is not supported`)
+end
+
+local function compile_filters(schema, filters, p)
+    local out = []
+    for _, node in filters do
+        local s
+        if node.kind == "group" then
+            s = compile_filters(schema, node.filters, p)?
+            if s ~= "" then s = `(${s})` end
+        else
+            s = compile_cond(schema, node, p)?
+        end
+        if s ~= "" then
+            if len(out) > 0 then out[] = (node.logic == "or") and " OR " or " AND " end
+            out[] = s
+        end
+    end
+    return string.join(out, "")
+end
+
+local function where_clause(schema, plan, p)
+    local w = compile_filters(schema, plan.filters or [], p)?
+    return w ~= "" and ` WHERE ${w}` or ""
+end
+
+-- sql.where(schema, filters, d, params) → condition_sql | error
+-- The bare condition (no WHERE keyword), for hand-written statements: its
+-- values are appended to `params`, and placeholders number on from the
+-- parameters already there.
+function M.where(schema, filters, d, params)
+    return compile_filters(schema, filters, {d = d, values = params})
+end
+
+local function table_name(plan, schema, d)
+    return d.quote(plan.collection or schema.name)
+end
+
+local function order_clause(schema, plan, d)
+    if plan.orders == nil or len(plan.orders) == 0 then return "" end
+    local ord = []
+    for _, o in plan.orders do
+        ord[] = `${M.column(schema, o.field, d)} ${string.upper(o.dir or "asc")}`
+    end
+    return ` ORDER BY ${string.join(ord, ", ")}`
+end
+
+-- The columns a projection reads: nested paths read their root column.
+local function select_list(plan, d)
+    if plan.fields == nil or len(plan.fields) == 0 then return "*" end
+    local seen = [=]
+    local cols = []
+    for _, path in plan.fields do
+        local root = string.split(path, ".")[0]
+        if not seen[root] then
+            seen[root] = true
+            cols[] = d.quote(root)
+        end
+    end
+    return string.join(cols, ", ")
+end
+
+-- ---- Statements ----
+
+-- sql.find(schema, plan, d) → {sql, params} | error
+function M.find(schema, plan, d)
+    local p = new_params(d)
+    local s = `SELECT ${select_list(plan, d)} FROM ${table_name(plan, schema, d)}`
+    s ..= where_clause(schema, plan, p)?
+    local ord = order_clause(schema, plan, d)
+    s ..= ord
+    s = d.paging(s, plan.limit, plan.offset, ord ~= "")
+    return {sql = s, params = p.values}
+end
+
+-- sql.count(schema, plan, d) → {sql, params} | error (limit/offset respected)
+function M.count(schema, plan, d)
+    local p = new_params(d)
+    local from = table_name(plan, schema, d)
+    local w = where_clause(schema, plan, p)?
+    if plan.limit == nil and plan.offset == nil then
+        return {sql = `SELECT COUNT(*) FROM ${from}${w}`, params = p.values}
+    end
+    local inner = d.paging(`SELECT 1 AS one FROM ${from}${w}`, plan.limit, plan.offset, false)
+    return {sql = `SELECT COUNT(*) FROM (${inner}) AS rdd_sub`, params = p.values}
+end
+
+-- sql.insert(schema, doc, d) → {sql, params}
+-- With d.returning, the statement ends in RETURNING <primary key>.
+function M.insert(schema, doc, d)
+    local p = new_params(d)
+    local cols = []
+    local ph = []
+    for _, fname in schema.field_order do
+        if doc[fname] ~= nil then
+            cols[] = d.quote(fname)
+            ph[] = add_param(p, doc[fname], schema.fields[fname])
+        end
+    end
+    local s
+    if len(cols) == 0 then
+        s = `INSERT INTO ${d.quote(schema.name)} DEFAULT VALUES`
+    else
+        s = `INSERT INTO ${d.quote(schema.name)} (${string.join(cols, ", ")}) VALUES (${string.join(ph, ", ")})`
+    end
+    if d.returning and schema.primary_key ~= nil then
+        s ..= ` RETURNING ${d.quote(schema.primary_key)}`
+    end
+    return {sql = s, params = p.values}
+end
+
+-- sql.update(schema, plan, changes, d) → {sql, params} | error
+-- A dotted key ("endereco.cidade") changes one value inside a document column.
+function M.update(schema, plan, changes, d)
+    local p = new_params(d)
+    local sets = []
+    for _, k in list.keys(changes) do
+        local v = changes[k]
+        local parts = string.split(k, ".")
+        local col = d.quote(parts[0])
+        if len(parts) == 1 then
+            sets[] = `${col} = ${add_param(p, v, field_of(schema, k))}`
+        else
+            local ph = add_param(p, d.json_value and d.json_value(v) or v, nil)
+            sets[] = `${col} = ${d.json_set(col, list.slice(parts, 1), ph, v)}`
+        end
+    end
+    if len(sets) == 0 then return error("rdd/sql: update without changes") end
+    local s = `UPDATE ${table_name(plan, schema, d)} SET ${string.join(sets, ", ")}`
+    s ..= where_clause(schema, plan, p)?
+    return {sql = s, params = p.values}
+end
+
+-- sql.delete(schema, plan, d) → {sql, params} | error
+function M.delete(schema, plan, d)
+    local p = new_params(d)
+    local s = `DELETE FROM ${table_name(plan, schema, d)}`
+    s ..= where_clause(schema, plan, p)?
+    return {sql = s, params = p.values}
+end
+
+-- sql.create_table(schema, d) → sql
+function M.create_table(schema, d)
+    local cols = []
+    for _, fname in schema.field_order do
+        local f = schema.fields[fname]
+        local t = d.types[f.type] or d.types.any
+        local def
+        if f.primary_key and f.auto == true and f.type == "int" then
+            def = d.auto_pk(t)
+        else
+            def = t
+            if f.primary_key then def ..= " PRIMARY KEY" end
+            if f.unique then def ..= " UNIQUE" end
+        end
+        cols[] = `${d.quote(fname)} ${def}`
+    end
+    return d.create_table(d.quote(schema.name), schema.name, string.join(cols, ", "))
+end
+
+-- sql.hydrate(schema, row, fields, d) → document
+-- Turns a result row back into a document: the schema's fields (or the
+-- projected ones), bools and JSON columns decoded by d.read.
+function M.hydrate(schema, row, fields, d)
+    if row == nil then return nil end
+    local out = {}
+    local cols = schema.field_order
+    if fields ~= nil and len(fields) > 0 then
+        cols = []
+        local seen = [=]
+        for _, path in fields do
+            local root = string.split(path, ".")[0]
+            if not seen[root] then
+                seen[root] = true
+                cols[] = root
+            end
+        end
+    end
+    for _, fname in cols do
+        out[fname] = d.read(row[fname], schema:field(fname))
+    end
+    return out
+end
+
+-- ---- A ready-made RDD connection ----
+
+local Conn = {}
+
+function Conn.migrate(self, schema)
+    local _ = self.db:exec(M.create_table(schema, self.dialect))?
+    return true
+end
+
+function Conn.insert(self, schema, doc)
+    local st = M.insert(schema, doc, self.dialect)
+    local pk = schema.primary_key
+    local out = {}
+    for k, v in doc do out[k] = v end
+    if self.dialect.returning and pk ~= nil then
+        local id = self.db:value(st.sql, st.params)?
+        if out[pk] == nil then out[pk] = id end
+        return out
+    end
+    local _ = self.db:exec(st.sql, st.params)?
+    if pk ~= nil and out[pk] == nil and type(self.db.last_insert_id) == "function" then
+        out[pk] = self.db:last_insert_id()
+    end
+    return out
+end
+
+function Conn.find(self, schema, plan)
+    local st = M.find(schema, plan, self.dialect)?
+    local rows = self.db:query(st.sql, st.params)?
+    local out = []
+    for _, r in rows do out[] = M.hydrate(schema, r, plan.fields, self.dialect) end
+    return out
+end
+
+function Conn.count(self, schema, plan)
+    local st = M.count(schema, plan, self.dialect)?
+    return self.db:value(st.sql, st.params)
+end
+
+function Conn.update(self, schema, plan, changes)
+    local st = M.update(schema, plan, changes, self.dialect)?
+    return self.db:exec(st.sql, st.params)
+end
+
+function Conn.delete(self, schema, plan)
+    local st = M.delete(schema, plan, self.dialect)?
+    return self.db:exec(st.sql, st.params)
+end
+
+function Conn.transaction(self, fn)
+    if type(self.db.transaction) ~= "function" then return fn(self) end
+    return self.db:transaction(function(_) return fn(self) end)
+end
+
+function Conn.close(self)
+    return self.db:close()
+end
+
+-- sql.connection(db, d) → RDD connection over a database handle
+-- db needs query(sql, params) → rows, exec(sql, params) → changed count,
+-- value(sql, params) → first column of the first row and close(); it may
+-- have last_insert_id() and transaction(fn). The sqlite library's handle
+-- fits as is:
+--
+--   rdd.register_driver("sqlite", {open = function(opts)
+--       local db = sqlite.open(opts.path or ":memory:")?
+--       return sql.connection(db, sql.dialects.sqlite)
+--   end})
+function M.connection(db, d)
+    local c = {}
+    c.db = db
+    c.dialect = d or M.dialects.sqlite
+    for k, f in Conn do c[k] = f end
+    return c
+end
+
+return M

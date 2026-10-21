@@ -36,6 +36,9 @@ M.schema = schema_mod.new
 M.field = schema_mod.field
 M.query = query_mod.new
 
+-- SQL compiler for drivers of SQL engines (see sql.sea)
+M.sql = require("./sql")
+
 -- ---- Model (Schema bound to a Session) ----
 
 local function new_model(session, sch)

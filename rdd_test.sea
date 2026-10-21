@@ -5,239 +5,13 @@ local t = require("sea/test")
 local sqlite = require("../sea_vm/libs/sqlite/sqlite")
 local rdd = require("./rdd")
 
--- ---- Helper: Minimal SQLite driver registered for testing RDD contracts ----
-
-local function sql_col_expr(schema, field_path)
-    local parts = string.split(field_path, ".")
-    local root = parts[0]
-    if len(parts) == 1 then return root end
-    local f = schema:field(root)
-    if f ~= nil and (f.type == "document" or f.type == "map") then
-        local json_path = "$." .. string.join(list.slice(parts, 1), ".")
-        return `json_extract(${root}, '${json_path}')`
-    end
-    return field_path
-end
-
-local function bind_val(v)
-    if type(v) == "bool" then return v and 1 or 0 end
-    if type(v) == "table" or type(v) == "struct" or type(v) == "map" or type(v) == "array" then
-        return json.encode(v)
-    end
-    return v
-end
-
-local compile_filters
-
-compile_filters = function(schema, filters, params)
-    if len(filters) == 0 then return "" end
-    local clauses = []
-    for i, node in filters do
-        local prefix = ""
-        if i > 0 then
-            prefix = (node.logic == "or") and " OR " or " AND "
-        end
-        if node.kind == "group" then
-            local inner = compile_filters(schema, node.filters, params)
-            if inner ~= "" then
-                clauses[] = `${prefix}(${inner})`
-            end
-        else
-            local col = sql_col_expr(schema, node.field)
-            local op = node.op
-            if op == "is_null" then
-                clauses[] = `${prefix}${col} IS NULL`
-            elseif op == "is_not_null" then
-                clauses[] = `${prefix}${col} IS NOT NULL`
-            elseif op == "in" or op == "not_in" then
-                local ph = []
-                for _, item in node.value do
-                    ph[] = "?"
-                    params[] = bind_val(item)
-                end
-                local kw = (op == "in") and "IN" or "NOT IN"
-                clauses[] = `${prefix}${col} ${kw} (${string.join(ph, ", ")})`
-            elseif op == "between" then
-                clauses[] = `${prefix}${col} BETWEEN ? AND ?`
-                params[] = bind_val(node.value[0])
-                params[] = bind_val(node.value[1])
-            elseif op == "contains" then
-                clauses[] = `${prefix}${col} LIKE ?`
-                params[] = `%${node.value}%`
-            elseif op == "starts_with" then
-                clauses[] = `${prefix}${col} LIKE ?`
-                params[] = `${node.value}%`
-            elseif op == "ends_with" then
-                clauses[] = `${prefix}${col} LIKE ?`
-                params[] = `%${node.value}`
-            else
-                clauses[] = `${prefix}${col} ${op} ?`
-                params[] = bind_val(node.value)
-            end
-        end
-    end
-    return string.join(clauses, "")
-end
-
-local function hydrate_row(schema, row, projected_fields)
-    if row == nil then return nil end
-    local out = {}
-    local cols = len(projected_fields) > 0 and projected_fields or schema.field_order
-    for _, fname in cols do
-        local f = schema:field(fname)
-        local raw = row[fname]
-        if raw ~= nil and f ~= nil then
-            if f.type == "bool" then
-                out[fname] = (raw == 1 or raw == true)
-            elseif (f.type == "document" or f.type == "array" or f.type == "map") and type(raw) == "string" then
-                out[fname] = json.decode(raw)
-            else
-                out[fname] = raw
-            end
-        else
-            out[fname] = raw
-        end
-    end
-    return out
-end
+-- ---- SQLite driver registered for testing RDD contracts (rdd/sql does the SQL) ----
 
 local function make_sqlite_driver()
-    local Conn = {}
-
-    function Conn.migrate(self, schema)
-        local cols = []
-        for _, fname in schema.field_order do
-            local f = schema.fields[fname]
-            local col_type = "TEXT"
-            if f.type == "int" or f.type == "bool" then
-                col_type = "INTEGER"
-            elseif f.type == "number" then
-                col_type = "REAL"
-            end
-            local def = `${fname} ${col_type}`
-            if f.primary_key then
-                def ..= " PRIMARY KEY"
-                if f.auto == true and f.type == "int" then def ..= " AUTOINCREMENT" end
-            end
-            if f.unique then def ..= " UNIQUE" end
-            cols[] = def
-        end
-        local sql = `CREATE TABLE IF NOT EXISTS ${schema.name} (${string.join(cols, ", ")})`
-        local _ = self.db:exec(sql)?
-        return true
-    end
-
-    function Conn.insert(self, schema, doc)
-        local cols = []
-        local ph = []
-        local params = []
-        for _, fname in schema.field_order do
-            if doc[fname] ~= nil then
-                cols[] = fname
-                ph[] = "?"
-                params[] = bind_val(doc[fname])
-            end
-        end
-        local sql = `INSERT INTO ${schema.name} (${string.join(cols, ", ")}) VALUES (${string.join(ph, ", ")})`
-        local _ = self.db:exec(sql, params)?
-        local out = {}
-        for k, v in doc do out[k] = v end
-        local pk = schema.primary_key
-        if pk ~= nil and out[pk] == nil then
-            out[pk] = self.db:last_insert_id()
-        end
-        return out
-    end
-
-    function Conn.find(self, schema, plan)
-        local select_cols = "*"
-        if len(plan.fields) > 0 then
-            select_cols = string.join(plan.fields, ", ")
-        end
-        local params = []
-        local sql = `SELECT ${select_cols} FROM ${plan.collection}`
-        local where_sql = compile_filters(schema, plan.filters, params)
-        if where_sql ~= "" then sql ..= ` WHERE ${where_sql}` end
-        if len(plan.orders) > 0 then
-            local ord = []
-            for _, o in plan.orders do
-                ord[] = `${sql_col_expr(schema, o.field)} ${string.upper(o.dir)}`
-            end
-            sql ..= ` ORDER BY ${string.join(ord, ", ")}`
-        end
-        if plan.limit ~= nil then
-            sql ..= ` LIMIT ${plan.limit}`
-        end
-        if plan.offset ~= nil then
-            if plan.limit == nil then sql ..= " LIMIT -1" end
-            sql ..= ` OFFSET ${plan.offset}`
-        end
-        local rows = self.db:query(sql, params)?
-        local out = []
-        for _, r in rows do
-            out[] = hydrate_row(schema, r, plan.fields)
-        end
-        return out
-    end
-
-    function Conn.count(self, schema, plan)
-        local params = []
-        local sql = `SELECT count(*) FROM ${plan.collection}`
-        local where_sql = compile_filters(schema, plan.filters, params)
-        if where_sql ~= "" then sql ..= ` WHERE ${where_sql}` end
-        if plan.limit ~= nil then
-            sql = `SELECT count(*) FROM (${sql} LIMIT ${plan.limit})`
-        end
-        return self.db:value(sql, params)
-    end
-
-    function Conn.update(self, schema, plan, changes)
-        local sets = []
-        local params = []
-        for _, k in list.keys(changes) do
-            local v = changes[k]
-            if string.contains(k, ".") then
-                local parts = string.split(k, ".")
-                local root = parts[0]
-                local json_path = "$." .. string.join(list.slice(parts, 1), ".")
-                sets[] = `${root} = json_set(COALESCE(${root}, '{}'), '${json_path}', ?)`
-                params[] = bind_val(v)
-            else
-                sets[] = `${k} = ?`
-                params[] = bind_val(v)
-            end
-        end
-        local sql = `UPDATE ${plan.collection} SET ${string.join(sets, ", ")}`
-        local where_sql = compile_filters(schema, plan.filters, params)
-        if where_sql ~= "" then sql ..= ` WHERE ${where_sql}` end
-        return self.db:exec(sql, params)
-    end
-
-    function Conn.delete(self, schema, plan)
-        local params = []
-        local sql = `DELETE FROM ${plan.collection}`
-        local where_sql = compile_filters(schema, plan.filters, params)
-        if where_sql ~= "" then sql ..= ` WHERE ${where_sql}` end
-        return self.db:exec(sql, params)
-    end
-
-    function Conn.transaction(self, fn)
-        return self.db:transaction(function(_)
-            return fn(self)
-        end)
-    end
-
-    function Conn.close(self)
-        return self.db:close()
-    end
-
     return {
         open = function(opts)
             local db = sqlite.open(opts.path or ":memory:")?
-            local c = {}
-            c.db = db
-            for k, f in Conn do c[k] = f end
-            return c
+            return rdd.sql.connection(db, rdd.sql.dialects.sqlite)
         end,
     }
 end
@@ -428,6 +202,44 @@ t.describe("rdd query builder and abstract query plan (AST)", function()
     end)
 end)
 
+t.describe("rdd/sql compiler and dialects", function()
+    local plan = t.no_error(rdd.query(Clientes)
+        :where("(nome = ? or endereco.uf = ?) and saldo between ? and ?", "Ana", "SP", 10, 20)
+        :where("nome", "ilike", "a%"):where_in("id", [])
+        :order_by("-saldo"):limit(5):offset(10)
+        :to_plan())
+    local sql = rdd.sql
+
+    t.it("numbers placeholders and pages per dialect", function()
+        local st = t.no_error(sql.find(Clientes, plan, sql.dialects.postgres))
+        t.eq(st.sql, string.join([
+            "SELECT * FROM \"clientes\" WHERE (\"nome\" = $1 OR \"endereco\" #>> '{uf}' = $2)",
+            "AND \"saldo\" BETWEEN $3 AND $4 AND \"nome\" ILIKE $5 AND 1 = 0",
+            "ORDER BY \"saldo\" DESC LIMIT 5 OFFSET 10",
+        ], " "))
+        t.eq(st.params, ["Ana", "SP", 10, 20, "a%"])
+        st = t.no_error(sql.find(Clientes, plan, sql.dialects.sqlserver))
+        t.eq(st.sql, string.join([
+            "SELECT * FROM [clientes] WHERE ([nome] = @p1 OR JSON_VALUE([endereco], '$.uf') = @p2)",
+            "AND [saldo] BETWEEN @p3 AND @p4 AND LOWER([nome]) LIKE LOWER(@p5) AND 1 = 0",
+            "ORDER BY [saldo] DESC OFFSET 10 ROWS FETCH NEXT 5 ROWS ONLY",
+        ], " "))
+    end)
+
+    t.it("escapes LIKE patterns, quotes identifiers and continues parameters", function()
+        local p = t.no_error(rdd.query(Clientes):where("nome", "contains", "50%_"):to_plan())
+        local st = t.no_error(sql.find(Clientes, p, sql.dialects.sqlite))
+        t.eq(st.sql, "SELECT * FROM \"clientes\" WHERE \"nome\" LIKE ? ESCAPE '\\'")
+        t.eq(st.params, ["%50\\%\\_%"])
+        local params = ["x"]
+        t.eq(t.no_error(sql.where(Clientes, p.filters, sql.dialects.postgres, params)), "\"nome\" LIKE $2 ESCAPE '\\'")
+        t.eq(len(params), 2)
+        local d = sql.dialect({quote = function(n) return "`" .. n .. "`" end})
+        t.eq(sql.create_table(Endereco, d),
+            "CREATE TABLE IF NOT EXISTS `enderecos` (`cidade` TEXT, `numero` INTEGER, `rua` TEXT, `uf` TEXT)")
+    end)
+end)
+
 t.describe("rdd end-to-end with registered SQLite driver", function()
     local db = nil
     local model = nil
@@ -526,6 +338,37 @@ t.describe("rdd end-to-end with registered SQLite driver", function()
         local deleted = t.no_error(model:where("ativo", false):delete())
         t.eq(deleted, 1)
         t.eq(t.no_error(model:count()), 2)
+    end)
+
+    t.it("runs every operator through rdd/sql", function()
+        local _ = t.no_error(model:insert_many([
+            {nome = "Ana", email = "ana@x.com", saldo = 10.0, endereco = {rua = "R", cidade = "Santos", uf = "SP"}},
+            {nome = "Bia_1", email = "bia@x.com", saldo = 20.0, endereco = {rua = "R", cidade = "Rio", uf = "RJ"}},
+            {nome = "Caio 50%", saldo = 30.0, endereco = {rua = "R", cidade = "Recife", uf = "PE"}},
+            {nome = "Duda", email = "duda@x.com", saldo = 40.0, endereco = {rua = "R", cidade = "Natal", uf = "RN"}},
+        ]))
+        local function names(q)
+            local out = []
+            for _, r in t.no_error(q:order_by("nome"):all()) do out[] = r.nome end
+            return string.join(out, ",")
+        end
+        t.eq(names(model:where_in("endereco.uf", ["SP", "PE"])), "Ana,Caio 50%")
+        t.eq(names(model:where_not_in("endereco.uf", ["SP", "PE"])), "Bia_1,Duda")
+        t.eq(names(model:where_in("nome", [])), "")
+        t.eq(names(model:where_between("saldo", 15, 35)), "Bia_1,Caio 50%")
+        t.eq(names(model:where_null("email")), "Caio 50%")
+        t.eq(names(model:where("email is not null and saldo >= ?", 20)), "Bia_1,Duda")
+        t.eq(names(model:where("nome", "contains", "50%")), "Caio 50%")
+        t.eq(names(model:where("nome", "contains", "_")), "Bia_1")
+        t.eq(names(model:where("nome", "starts_with", "D")), "Duda")
+        t.eq(names(model:where("nome", "ends_with", "a")), "Ana,Duda")
+        t.eq(names(model:where("nome", "ilike", "a%")), "Ana")
+        t.eq(names(model:where("nome", "!=", "Ana"):limit(2):offset(1)), "Caio 50%,Duda")
+        t.eq(t.no_error(model:where("saldo", ">", 10):limit(2):count()), 2)
+        t.eq(t.no_error(model:query():offset(3):count()), 1)
+        local proj = t.no_error(model:where("nome", "Ana"):fields("nome", "endereco.uf"):first())
+        t.eq(proj.endereco.uf, "SP")
+        t.is_nil(proj.saldo)
     end)
 
     t.it("supports transactions and rolls back on error", function()

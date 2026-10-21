@@ -154,6 +154,71 @@ rdd.register_driver("nome_do_driver", {
 }
 ```
 
+### Drivers SQL: `rdd.sql`
+
+Para bancos SQL não é preciso traduzir o plano à mão. O `rdd.sql` (arquivo `sql.sea`) compila o plano em SQL parametrizado, e as diferenças entre bancos ficam num **dialeto**: `rdd.sql.dialects.sqlite`, `.postgres` e `.sqlserver`.
+
+Um driver SQLite completo:
+
+```sea
+local sqlite = require("sqlite")
+
+rdd.register_driver("sqlite", {
+    open = function(opts)
+        local db = sqlite.open(opts.path or ":memory:")?
+        return rdd.sql.connection(db, rdd.sql.dialects.sqlite)
+    end,
+})
+```
+
+`sql.connection(db, dialeto)` implementa todo o contrato do driver. O `db` precisa ter:
+- `query(sql, params)`, que devolve as linhas;
+- `exec(sql, params)`, que devolve quantas linhas mudaram;
+- `value(sql, params)`, que devolve a primeira coluna da primeira linha;
+- `close()`;
+- opcionalmente, `last_insert_id()` e `transaction(fn)`.
+
+O handle da biblioteca `sqlite` do Sea já serve como está. Para um banco cuja API não bate, o driver pode usar as funções de compilação diretamente:
+
+| Função | Resultado |
+| --- | --- |
+| `sql.find(schema, plan, d)` | `{sql, params}` do `SELECT` |
+| `sql.count(schema, plan, d)` | `{sql, params}` do `SELECT COUNT(*)`, respeitando `limit`/`offset` |
+| `sql.insert(schema, doc, d)` | `{sql, params}` do `INSERT` (com `RETURNING` no postgres) |
+| `sql.update(schema, plan, changes, d)` | `{sql, params}` do `UPDATE`; uma chave `"endereco.cidade"` altera só esse valor dentro da coluna JSON |
+| `sql.delete(schema, plan, d)` | `{sql, params}` do `DELETE` |
+| `sql.create_table(schema, d)` | o `CREATE TABLE` que não recria uma tabela existente |
+| `sql.where(schema, filters, d, params)` | só a condição, acrescentando os valores em `params` (para SQL escrito à mão) |
+| `sql.hydrate(schema, row, fields, d)` | a linha de volta como documento: bools e colunas JSON decodificados |
+
+O que o compilador garante:
+- Os valores vão sempre como parâmetros.
+- Os nomes de tabela e coluna vão entre aspas do dialeto (`"x"` ou `[x]`).
+- `contains`, `starts_with` e `ends_with` escapam `%` e `_` do valor.
+- `in []` vira uma condição falsa.
+- `= nil` vira `IS NULL`.
+- `ilike` vira `LOWER(..) LIKE LOWER(..)` onde o banco não tem `ILIKE`.
+
+Os campos aninhados são lidos com `json_extract` no SQLite, `#>>` no postgres e `JSON_VALUE` no SQL Server.
+
+Para outro banco, ou para ajustar um dialeto existente, use `rdd.sql.dialect(sobrescritas [, base])`. Os campos que podem ser sobrescritos são:
+- `placeholder(n)`;
+- `quote(nome)`;
+- `has_ilike`;
+- `bind(v, campo)` e `read(v, campo)`;
+- `json_get` e `json_set`;
+- `paging`;
+- `types` (o tipo de coluna de cada tipo do schema);
+- `auto_pk`;
+- `returning`;
+- `create_table`.
+
+Por exemplo:
+
+```sea
+local mysql = rdd.sql.dialect({quote = function(n) return "`" .. n .. "`" end})
+```
+
 ---
 
 ## 4. Executando os Testes

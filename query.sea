@@ -169,9 +169,11 @@ end
 -- ? (an array); field between v and v; field is [not] null. and binds
 -- tighter than or; parentheses group. Keywords in any case.
 
-local KEYWORDS = {["and"] = true, ["or"] = true, ["not"] = true, ["in"] = true, ["is"] = true, ["null"] = true,
+local KEYWORDS = {
+    ["and"] = true, ["or"] = true, ["not"] = true, ["in"] = true, is = true, null = true,
     between = true, like = true, ilike = true, contains = true, starts_with = true, ends_with = true,
-    ["true"] = true, ["false"] = true}
+    ["true"] = true, ["false"] = true,
+}
 
 -- the tokens of an expression: {kind = "name"|"kw"|"op"|"num"|"str"|"ph"|"(" |")"|",", text}
 local function tokenize(src)
