@@ -772,7 +772,7 @@ function M.connection(db, d)
     c.db = db
     c.dialect = d or M.dialects.sqlite
     c.joins = true -- find/count/aggregate compile plan.joins
-    c.raw = true   -- and where_raw conditions
+    c.raw = true   -- and raw() conditions
     for k, f in Conn do c[k] = f end
     return c
 end

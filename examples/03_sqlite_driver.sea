@@ -112,18 +112,22 @@ local function main()
     printf("  SQL: %s\n  params: %s\n", st.sql, json.encode(st.params))
     for _, c in q:all()? do printf("  %s (%s, R$ %.2f)\n", c.nome, c.endereco.uf, c.saldo) end
 
-    section("Operadores")
+    section("Operadores: tudo por where(campo, operador, valor)")
     local function nomes(query)
         local out = []
         for _, r in query:order_by("nome"):all()? do out[] = r.nome end
         return string.join(out, ", ")
     end
-    printf("  in [PR, PE]:             %s\n", nomes(clientes:where_in("endereco.uf", ["PR", "PE"])))
-    printf("  saldo between 400..1500: %s\n", nomes(clientes:where_between("saldo", 400, 1500)))
-    printf("  sem e-mail (nil):        %s\n", nomes(clientes:where("email", nil)))
-    printf("  nome ilike 'b%%':         %s\n", nomes(clientes:where("nome", "ilike", "b%")))
+    local function show(label, query) printf("  %s %s\n", pad(label, 34), nomes(query)) end
+    show("uf in [PR, PE]", clientes:where("endereco.uf", "in", ["PR", "PE"]))
+    show("uf not in [SP, PR]", clientes:where("endereco.uf", "not in", ["SP", "PR"]))
+    show("saldo between 400 e 1500", clientes:where("saldo", "between", 400, 1500))
+    show("sem e-mail (nil)", clientes:where("email", nil))
+    show("nome starts with 'B'", clientes:where("nome", "starts with", "B"))
+    show("nome ilike 'e%'", clientes:where("nome", "ilike", "e%"))
+    show("tabela {ativo, uf = [SP, RJ]}", clientes:where({ativo = true, ["endereco.uf"] = ["SP", "RJ"]}))
     -- contains escapa o % do valor: só casa com o texto "50%"
-    printf("  produto contém '50%%':    %s\n", nomes(produtos:where("nome", "contains", "50%")))
+    show("produto contains '50%'", produtos:where("nome", "contains", "50%"))
 
     section("Pedidos com cliente e produto (dois joins)")
     local itens = pedidos:join(Clientes, "c", "c.id = cliente_id")
@@ -177,8 +181,8 @@ local function main()
         printf("  acima da média: %s (R$ %.2f, ativo = %s)\n", c.nome, c.saldo, tostring(c.ativo))
     end
     -- um trecho cru no meio de uma query normal
-    local achado = clientes:where("ativo", true):where_raw("lower(nome) = lower(?)", "ELISA"):first()?
-    printf("  where_raw: %s (%s)\n", achado.nome, achado.endereco.cidade)
+    local achado = clientes:where("ativo", true):where(rdd.raw("lower(nome) = lower(?)", "ELISA")):first()?
+    printf("  rdd.raw: %s (%s)\n", achado.nome, achado.endereco.cidade)
     printf("  exec: %d linha(s) alterada(s)\n", db:exec("UPDATE clientes SET tags = ? WHERE tags IS NULL", "[]")?)
 
     section("Paginação")

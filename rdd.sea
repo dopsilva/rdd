@@ -35,6 +35,8 @@ M.drivers = driver.list
 M.schema = schema_mod.new
 M.field = schema_mod.field
 M.query = query_mod.new
+-- q:where(rdd.raw("lower(nome) = ?", "ana")) — a raw SQL condition
+M.raw = query_mod.raw
 
 -- SQL compiler for drivers of SQL engines (see sql.sea)
 M.sql = require("./sql")
@@ -171,11 +173,6 @@ function Model.or_where(self, ...)
     local q = self:query()
     return q.or_where(q, ...)
 end
-function Model.where_in(self, field, values) return self:query():where_in(field, values) end
-function Model.where_not_in(self, field, values) return self:query():where_not_in(field, values) end
-function Model.where_null(self, field) return self:query():where_null(field) end
-function Model.where_not_null(self, field) return self:query():where_not_null(field) end
-function Model.where_between(self, field, low, high) return self:query():where_between(field, low, high) end
 function Model.fields(self, ...)
     local q = self:query()
     return q.fields(q, ...)
@@ -198,14 +195,6 @@ function Model.group_by(self, ...)
     return q.group_by(q, ...)
 end
 function Model.aggregate(self, specs) return self:query():aggregate(specs) end
-function Model.where_raw(self, sql, ...)
-    local q = self:query()
-    return q.where_raw(q, sql, ...)
-end
-function Model.or_where_raw(self, sql, ...)
-    local q = self:query()
-    return q.or_where_raw(q, sql, ...)
-end
 
 -- model:raw(sql, values...) → documents of this schema | error
 -- A hand-written query; each row comes back as a document (the schema's

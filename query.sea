@@ -110,7 +110,16 @@ local function clone_filters(filters)
     return out
 end
 
-local function add_condition(q, logic, a, b, c, nargs)
+-- operator spellings accepted in where(field, op, value), lowercased with
+-- spaces collapsed, mapped to the plan's operator names
+local OP_ALIASES = {
+    ["=="] = "=", ["~="] = "!=", ["<>"] = "!=",
+    ["not in"] = "not_in", not_in = "not_in",
+    ["starts with"] = "starts_with", ["ends with"] = "ends_with",
+    ["is null"] = "is_null", ["is not null"] = "is_not_null",
+}
+
+local function add_condition(q, logic, a, b, c, nargs, d)
     if q._err ~= nil then return q end
 
     -- Grouped sub-query: q:where(function(sub) ... end)
@@ -136,12 +145,13 @@ local function add_condition(q, logic, a, b, c, nargs)
         return q
     end
 
-    -- Equality map/table shorthand: q:where({ativo = true, uf = "SP"})
+    -- Equality map/table shorthand: q:where({ativo = true, uf = ["SP", "RJ"]})
+    -- (an array value means in)
     if nargs == 1 and is_record(a) then
         local keys = list.keys(a)
         for i, k in keys do
             local item_logic = (i == 0) and logic or "and"
-            add_condition(q, item_logic, k, "=", a[k], 3)
+            add_condition(q, item_logic, k, type(a[k]) == "array" and "in" or "=", a[k], 3)
             if q._err ~= nil then return q end
         end
         return q
@@ -158,8 +168,16 @@ local function add_condition(q, logic, a, b, c, nargs)
         return q
     end
 
-    if op == "~=" or op == "<>" then op = "!=" end
-    if op == "==" then op = "=" end
+    if type(op) == "string" then
+        op = string.lower(string.trim(re.gsub("\\s+", op, " ")))
+        op = OP_ALIASES[op] or op
+    end
+    -- where("saldo", "between", 400, 1500)
+    if op == "between" and nargs == 4 then val = [c, d] end
+    if nargs == 4 and op ~= "between" then
+        q._err = error(`rdd: where('${tostring(field)}', '${op}', ...) takes one value; only between takes two`)
+        return q
+    end
     -- comparing with nil means a null test, so drivers need no special case
     if val == nil and op == "=" then op = "is_null" end
     if val == nil and op == "!=" then op = "is_not_null" end
@@ -542,79 +560,62 @@ function Query.left_join(self, target, alias, on)
     return add_join(self, "left", target, alias, on)
 end
 
-local function where_args(q, logic, args)
-    if is_expression(args[0]) then return add_expression(q, logic, args[0], list.slice(args, 1)) end
-    return add_condition(q, logic, args[0], args[1], args[2], len(args))
+-- query.raw(sql, values...) → a SQL condition to pass to where()/or_where()
+-- (also rdd.raw). It goes into the query as written, in parentheses, its ?
+-- taking the values as parameters (?? is a literal ?). The text is not
+-- checked against the schema; with joins, name columns as the SQL does
+-- ("p".valor). Only SQL drivers (conn.raw = true) run it.
+function M.raw(sql, ...)
+    local r = {}
+    r.__raw = true
+    r.sql = sql
+    r.values = [...]
+    return r
 end
 
--- q:where(field, [op,] value) | q:where({k = v}) | q:where(function(sub) ... end)
--- | q:where("expression with ? placeholders", values...)
-function Query.where(self, ...)
-    return where_args(self, "and", {...})
-end
-
--- q:and_where(...) — alias for where(...)
-function Query.and_where(self, ...)
-    return where_args(self, "and", {...})
-end
-
--- q:or_where(field, [op,] value) | q:or_where({k = v}) | q:or_where(function(sub) ... end)
--- | q:or_where("expression", values...)
-function Query.or_where(self, ...)
-    return where_args(self, "or", {...})
-end
-
--- q:where_in(field, list)
-function Query.where_in(self, field, values)
-    return add_condition(self, "and", field, "in", values, 3)
-end
-
--- q:where_not_in(field, list)
-function Query.where_not_in(self, field, values)
-    return add_condition(self, "and", field, "not_in", values, 3)
-end
-
--- q:where_null(field)
-function Query.where_null(self, field)
-    return add_condition(self, "and", field, "is_null", nil, 3)
-end
-
--- q:where_not_null(field)
-function Query.where_not_null(self, field)
-    return add_condition(self, "and", field, "is_not_null", nil, 3)
-end
-
--- q:where_between(field, low, high)
-function Query.where_between(self, field, low, high)
-    return add_condition(self, "and", field, "between", [low, high], 3)
-end
-
-local function add_raw(q, logic, sql, values)
+local function add_raw(q, logic, r)
     if q._err ~= nil then return q end
-    if type(sql) ~= "string" or string.trim(sql) == "" then
-        q._err = error("rdd: where_raw() expects a SQL condition string")
+    if type(r.sql) ~= "string" or string.trim(r.sql) == "" then
+        q._err = error("rdd: raw() expects a SQL condition string")
         return q
     end
     local node = {}
     node.kind = "raw"
     node.logic = logic
-    node.sql = sql
-    node.values = values
+    node.sql = r.sql
+    node.values = r.values
     q._filters[] = node
     return q
 end
 
--- q:where_raw("LOWER(nome) = ?", values...) — a SQL condition passed through
--- as written (in parentheses), its ? taking the values as parameters (?? is a
--- literal ?). The text is not checked against the schema; with joins, name
--- columns as the SQL does ("p".valor). Only SQL drivers run it.
-function Query.where_raw(self, sql, ...)
-    return add_raw(self, "and", sql, [...])
+local function where_args(q, logic, args)
+    if len(args) == 1 and is_record(args[0]) and args[0].__raw == true then return add_raw(q, logic, args[0]) end
+    if is_expression(args[0]) then return add_expression(q, logic, args[0], list.slice(args, 1)) end
+    return add_condition(q, logic, args[0], args[1], args[2], len(args), args[3])
 end
 
--- q:or_where_raw(sql, values...) — as where_raw(), joined with or
-function Query.or_where_raw(self, sql, ...)
-    return add_raw(self, "or", sql, [...])
+-- q:where(...) adds a condition joined with and:
+--   where("nome", "Ana")                        equality (a nil value: is null)
+--   where("saldo", ">", 100)                    = != <> < <= > >= like ilike
+--   where("uf", "in", ["SP", "RJ"])             in, not in, contains,
+--                                               starts with, ends with
+--   where("saldo", "between", 400, 1500)
+--   where({ativo = true, uf = ["SP", "RJ"]})    equalities; an array is in
+--   where("uf in ? and saldo > ?", ufs, 100)    an expression
+--   where(function(g) g:where(...):or_where(...) end)   a group
+--   where(rdd.raw("lower(nome) = ?", "ana"))    raw SQL
+function Query.where(self, ...)
+    return where_args(self, "and", [...])
+end
+
+-- q:and_where(...) — alias for where(...)
+function Query.and_where(self, ...)
+    return where_args(self, "and", [...])
+end
+
+-- q:or_where(...) — the same forms as where(), joined with or
+function Query.or_where(self, ...)
+    return where_args(self, "or", [...])
 end
 
 -- q:fields(f1, f2, ...) or q:fields(["f1", "f2"]) — projection
@@ -1189,7 +1190,7 @@ local function require_conn(self)
     end
     -- only a driver that says so (conn.raw = true) gets raw SQL conditions
     if self.conn.raw ~= true and has_raw(self._filters) then
-        return error("rdd: where_raw() needs a SQL driver (conn.raw = true)")
+        return error("rdd: a raw() condition needs a SQL driver (conn.raw = true)")
     end
     return self.conn
 end
@@ -1200,7 +1201,7 @@ function Query.all(self)
     local plan = self:to_plan()?
     -- a driver takes plan.joins only when it says so (conn.joins = true)
     if plan.joins ~= nil and conn.joins ~= true then
-        if has_raw(plan.filters) then return error("rdd: where_raw() cannot run in an in-memory join") end
+        if has_raw(plan.filters) then return error("rdd: a raw() condition cannot run in an in-memory join") end
         return M.join_rows(conn, plan)
     end
     if plan.aggregates == nil then return conn:find(self.schema, plan) end

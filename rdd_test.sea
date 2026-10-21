@@ -145,7 +145,7 @@ end)
 t.describe("rdd query builder and abstract query plan (AST)", function()
     t.it("builds a driver-agnostic AST for complex queries", function()
         local q = rdd.query(Clientes):fields("id", "nome", "endereco.cidade"):where("ativo", true):where("saldo", ">=", 100):where("endereco.uf", "SP"):or_where(function(sub)
-            sub:where("endereco.uf", "RJ"):where_in("nome", ["Ana", "Bia"])
+            sub:where("endereco.uf", "RJ"):where("nome", "in", ["Ana", "Bia"])
         end):order_by("-saldo"):order_by("nome", "asc"):limit(20):offset(40)
 
         local plan = t.no_error(q:to_plan())
@@ -204,6 +204,28 @@ t.describe("rdd query builder and abstract query plan (AST)", function()
         t.eq(len(plan.filters[1].filters), 2)
     end)
 
+    t.it("takes every operator through where(field, op, value...)", function()
+        local function filters(q) return t.no_error(q:to_plan()).filters end
+        local function cond(field, op, value) return {kind = "cond", logic = "and", field = field, op = op, value = value} end
+        local q = rdd.query(Clientes)
+        t.eq(filters(q:clone():where("endereco.uf", "in", ["SP", "RJ"])), [cond("endereco.uf", "in", ["SP", "RJ"])])
+        t.eq(filters(q:clone():where("endereco.uf", "NOT  In", ["SP"])), [cond("endereco.uf", "not_in", ["SP"])])
+        t.eq(filters(q:clone():where("saldo", "between", 10, 20)), [cond("saldo", "between", [10, 20])])
+        t.eq(filters(q:clone():where("nome", "starts with", "A")), [cond("nome", "starts_with", "A")])
+        t.eq(filters(q:clone():where("email", "is not null", nil)), [cond("email", "is_not_null", nil)])
+        t.eq(filters(q:clone():where("email", "<>", nil)), [cond("email", "is_not_null", nil)])
+        -- a table: equalities, an array value is in
+        t.eq(filters(q:clone():where({ativo = true, nome = ["Ana", "Bia"]})), [cond("ativo", "=", true), cond("nome", "in", ["Ana", "Bia"])])
+        -- the same plan as the expression
+        t.eq(filters(q:clone():where("endereco.uf", "in", ["SP"]):where("saldo", "between", 1, 2)),
+            filters(q:clone():where("endereco.uf in ? and saldo between ? and ?", ["SP"], 1, 2)))
+        local raw = filters(q:clone():where(rdd.raw("lower(nome) = ?", "ana")))
+        t.eq(raw, [{kind = "raw", logic = "and", sql = "lower(nome) = ?", values = ["ana"]}])
+        t.is_error(q:clone():where("saldo", ">", 1, 2):to_plan(), "only between takes two")
+        t.is_error(q:clone():where("saldo", "entre", 1):to_plan(), "invalid query operator 'entre'")
+        t.is_error(q:clone():where(rdd.raw("")):to_plan(), "raw() expects")
+    end)
+
     t.it("catches unknown fields in fluent query chains", function()
         local q = rdd.query(Clientes):where("endereco.pais", "BR"):order_by("nome")
         t.is_error(q:to_plan(), "unknown field 'clientes.endereco.pais'")
@@ -213,7 +235,7 @@ end)
 t.describe("rdd/sql compiler and dialects", function()
     local plan = t.no_error(rdd.query(Clientes)
         :where("(nome = ? or endereco.uf = ?) and saldo between ? and ?", "Ana", "SP", 10, 20)
-        :where("nome", "ilike", "a%"):where_in("id", [])
+        :where("nome", "ilike", "a%"):where("id", "in", [])
         :order_by("-saldo"):limit(5):offset(10)
         :to_plan())
     local sql = rdd.sql
@@ -369,11 +391,11 @@ t.describe("rdd end-to-end with registered SQLite driver", function()
             for _, r in t.no_error(q:order_by("nome"):all()) do out[] = r.nome end
             return string.join(out, ",")
         end
-        t.eq(names(model:where_in("endereco.uf", ["SP", "PE"])), "Ana,Caio 50%")
-        t.eq(names(model:where_not_in("endereco.uf", ["SP", "PE"])), "Bia_1,Duda")
-        t.eq(names(model:where_in("nome", [])), "")
-        t.eq(names(model:where_between("saldo", 15, 35)), "Bia_1,Caio 50%")
-        t.eq(names(model:where_null("email")), "Caio 50%")
+        t.eq(names(model:where("endereco.uf", "in", ["SP", "PE"])), "Ana,Caio 50%")
+        t.eq(names(model:where("endereco.uf", "not in", ["SP", "PE"])), "Bia_1,Duda")
+        t.eq(names(model:where("nome", "in", [])), "")
+        t.eq(names(model:where("saldo", "between", 15, 35)), "Bia_1,Caio 50%")
+        t.eq(names(model:where("email", nil)), "Caio 50%")
         t.eq(names(model:where("email", nil)), "Caio 50%")
         t.eq(names(model:where("email", "!=", nil):where("saldo", "<", 30)), "Ana,Bia_1")
         t.eq(names(model:where("email = ? or nome = ?", nil, "Ana")), "Ana,Caio 50%")
@@ -512,7 +534,7 @@ t.describe("rdd end-to-end with registered SQLite driver", function()
         t.is_error(model:join(Pedidos, "p", "p.cliente_id = id"):where("p.pago", true):delete(), "does not take joins")
     end)
 
-    t.it("runs raw SQL: statements, model rows and where_raw", function()
+    t.it("runs raw SQL: statements, model rows and rdd.raw conditions", function()
         local _ = t.no_error(model:insert_many([
             {nome = "Ana", email = "a@x.com", saldo = 10.0, endereco = {rua = "R", cidade = "Santos", uf = "SP"}},
             {nome = "bia", saldo = 20.0, ativo = false, endereco = {rua = "R", cidade = "Rio", uf = "RJ"}},
@@ -528,18 +550,18 @@ t.describe("rdd end-to-end with registered SQLite driver", function()
         t.eq(docs[0].ativo, false)
         t.eq(docs[0].endereco.uf, "RJ")
 
-        rows = t.no_error(model:where("ativo", false):or_where_raw("upper(nome) = ?", "ANA"):order_by("nome"):all())
+        rows = t.no_error(model:where("ativo", false):or_where(rdd.raw("upper(nome) = ?", "ANA")):order_by("nome"):all())
         t.eq(len(rows), 2)
-        t.eq(t.no_error(model:where_raw("saldo * 2 > ?", 30):count()), 1)
+        t.eq(t.no_error(model:where(rdd.raw("saldo * 2 > ?", 30)):count()), 1)
 
-        local st = t.no_error(rdd.sql.find(Clientes, t.no_error(model:where("nome", "x"):where_raw("tags ?? ?", "vip"):to_plan()),
+        local st = t.no_error(rdd.sql.find(Clientes, t.no_error(model:where("nome", "x"):where(rdd.raw("tags ?? ?", "vip")):to_plan()),
             rdd.sql.dialects.postgres))
         t.eq(st.sql, "SELECT * FROM \"clientes\" WHERE \"nome\" = $1 AND (tags ? $2)")
 
         t.is_error(db:raw("SELECT ? AS a", 1, 2), "more values than '?'")
         t.is_error(db:raw("SELECT ? AS a"), "more '?' than values")
         model.conn.raw = false
-        t.is_error(model:where_raw("1 = 1"):all(), "needs a SQL driver")
+        t.is_error(model:where(rdd.raw("1 = 1")):all(), "needs a SQL driver")
     end)
 
     t.it("saves with upsert and with the lookup fallback", function()

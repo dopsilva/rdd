@@ -25,9 +25,10 @@
 --   conn.joins = true                        (a field, not a method: find/count/
 --       aggregate understand plan.joins; otherwise RDD joins in memory)
 --   conn.raw = true                          (filters may hold {kind = "raw",
---       logic, sql, values} nodes from where_raw)
+--       logic, sql, values} nodes from where(rdd.raw(...)))
 --   conn:raw_query(sql, values [, schema])   → rows | error (db:raw, model:raw)
---   conn:raw_exec(sql, values)               → changed rows | error (db:exec)--   conn:transaction(fn)                     → result of fn(conn) | error
+--   conn:raw_exec(sql, values)               → changed rows | error (db:exec)
+--   conn:transaction(fn)                     → result of fn(conn) | error
 
 local M = {}
 
