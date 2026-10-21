@@ -125,6 +125,7 @@ rdd.register_driver("nome_do_driver", {
         function conn:migrate(schema) ... end              -- → true | error
         function conn:insert_many(schema, docs) ... end    -- → array de docs | error
         function conn:count(schema, plan) ... end          -- → int | error
+        function conn:upsert(schema, doc) ... end          -- → doc_salvo | error (save() num comando só)
         function conn:transaction(fn) ... end              -- → fn(tx_conn) | error
 
         return conn
@@ -187,6 +188,7 @@ O handle da biblioteca `sqlite` do Sea já serve como está. Para um banco cuja 
 | `sql.find(schema, plan, d)` | `{sql, params}` do `SELECT` |
 | `sql.count(schema, plan, d)` | `{sql, params}` do `SELECT COUNT(*)`, respeitando `limit`/`offset` |
 | `sql.insert(schema, doc, d)` | `{sql, params}` do `INSERT` (com `RETURNING` no postgres) |
+| `sql.upsert(schema, doc, d)` | `{sql, params}` que insere ou atualiza pela chave primária (`ON CONFLICT` no SQLite/postgres, `MERGE` no SQL Server) |
 | `sql.update(schema, plan, changes, d)` | `{sql, params}` do `UPDATE`; uma chave `"endereco.cidade"` altera só esse valor dentro da coluna JSON |
 | `sql.delete(schema, plan, d)` | `{sql, params}` do `DELETE` |
 | `sql.create_table(schema, d)` | o `CREATE TABLE` que não recria uma tabela existente |

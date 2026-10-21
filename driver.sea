@@ -17,7 +17,8 @@
 --   conn:migrate(schema)                     → true | error
 --   conn:insert_many(schema, docs)           → array of inserted_docs | error
 --   conn:count(schema, plan)                 → int | error
---   conn:transaction(fn)                     → result of fn(conn) | error
+--   conn:upsert(schema, doc)                 → saved_doc | error
+--       (insert, or update the row with doc's primary key; save() uses it)--   conn:transaction(fn)                     → result of fn(conn) | error
 
 local M = {}
 

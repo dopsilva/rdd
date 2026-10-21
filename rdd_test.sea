@@ -224,6 +224,15 @@ t.describe("rdd/sql compiler and dialects", function()
             "AND [saldo] BETWEEN @p3 AND @p4 AND LOWER([nome]) LIKE LOWER(@p5) AND 1 = 0",
             "ORDER BY [saldo] DESC OFFSET 10 ROWS FETCH NEXT 5 ROWS ONLY",
         ], " "))
+        local E = rdd.schema("e", {id = {type = "int", primary_key = true}, nome = "string"})
+        t.eq(t.no_error(sql.upsert(E, {id = 1, nome = "x"}, sql.dialects.postgres)).sql,
+            "INSERT INTO \"e\" (\"id\", \"nome\") VALUES ($1, $2) ON CONFLICT (\"id\") DO UPDATE SET \"nome\" = excluded.\"nome\"")
+        t.eq(t.no_error(sql.upsert(E, {id = 1, nome = "x"}, sql.dialects.sqlserver)).sql, string.join([
+            "MERGE INTO [e] AS dst USING (SELECT @p1 AS [id], @p2 AS [nome]) AS src ON dst.[id] = src.[id]",
+            "WHEN MATCHED THEN UPDATE SET [nome] = src.[nome]",
+            "WHEN NOT MATCHED THEN INSERT ([id], [nome]) VALUES (src.[id], src.[nome]);",
+        ], " "))
+        t.is_error(sql.upsert(E, {nome = "x"}, sql.dialects.sqlite), "needs the primary key value")
     end)
 
     t.it("escapes LIKE patterns, quotes identifiers and continues parameters", function()
@@ -372,6 +381,25 @@ t.describe("rdd end-to-end with registered SQLite driver", function()
         local proj = t.no_error(model:where("nome", "Ana"):fields("nome", "endereco.uf"):first())
         t.eq(proj.endereco.uf, "SP")
         t.is_nil(proj.saldo)
+    end)
+
+    t.it("saves with upsert and with the lookup fallback", function()
+        local function check_save()
+            local a = t.no_error(model:save({nome = "Ana", email = "a@x.com", saldo = 1.0}))
+            t.not_nil(a.id)
+            t.no_error(model:save({id = a.id, nome = "Ana B", email = "a@x.com", saldo = 2.0}))
+            t.no_error(model:save({id = 99, nome = "Nova", email = "n@x.com"}))
+            t.eq(t.no_error(model:count()), 2)
+            local ana = t.no_error(model:find(a.id))
+            t.eq(ana.nome, "Ana B")
+            t.eq(ana.saldo, 2.0)
+            t.eq(t.no_error(model:find(99)).ativo, true)
+            t.no_error(model:query():delete())
+        end
+        t.eq(type(model.conn.upsert), "function")
+        check_save()
+        model.conn.upsert = nil
+        check_save()
     end)
 
     t.it("supports transactions and rolls back on error", function()

@@ -89,6 +89,16 @@ local BASE = {
     create_table = function(qname, name, cols)
         return `CREATE TABLE IF NOT EXISTS ${qname} (${cols})`
     end,
+    -- upsert(quoted_table, quoted_cols, placeholders, quoted_key) → insert, or update
+    -- the other columns of the row whose key already exists
+    upsert = function(qname, cols, phs, key)
+        local sets = []
+        for _, c in cols do
+            if c ~= key then sets[] = `${c} = excluded.${c}` end
+        end
+        local tail = len(sets) == 0 and "DO NOTHING" or `DO UPDATE SET ${string.join(sets, ", ")}`
+        return `INSERT INTO ${qname} (${string.join(cols, ", ")}) VALUES (${string.join(phs, ", ")}) ON CONFLICT (${key}) ${tail}`
+    end,
 }
 
 -- sql.dialect(overrides [, base]) → dialect (missing entries come from base,
@@ -170,6 +180,19 @@ M.dialects.sqlserver = M.dialect({
         map = "NVARCHAR(MAX)", document = "NVARCHAR(MAX)", array = "NVARCHAR(MAX)", any = "NVARCHAR(MAX)",
     },
     auto_pk = function(t) return `${t} IDENTITY(1,1) PRIMARY KEY` end,
+    upsert = function(qname, cols, phs, key)
+        local src = []
+        local sets = []
+        local vals = []
+        for i, c in cols do
+            src[] = `${phs[i]} AS ${c}`
+            vals[] = `src.${c}`
+            if c ~= key then sets[] = `${c} = src.${c}` end
+        end
+        local s = `MERGE INTO ${qname} AS dst USING (SELECT ${string.join(src, ", ")}) AS src ON dst.${key} = src.${key}`
+        if len(sets) > 0 then s ..= ` WHEN MATCHED THEN UPDATE SET ${string.join(sets, ", ")}` end
+        return s .. ` WHEN NOT MATCHED THEN INSERT (${string.join(cols, ", ")}) VALUES (${string.join(vals, ", ")});`
+    end,
     create_table = function(qname, name, cols)
         return `IF OBJECT_ID(${"N" .. sql_string(name)}, N'U') IS NULL CREATE TABLE ${qname} (${cols})`
     end,
@@ -353,6 +376,25 @@ function M.insert(schema, doc, d)
     return {sql = s, params = p.values}
 end
 
+-- sql.upsert(schema, doc, d) → {sql, params} | error
+-- One statement that inserts doc, or updates the row with its primary key.
+function M.upsert(schema, doc, d)
+    local pk = schema.primary_key
+    if pk == nil or doc[pk] == nil then
+        return error(`rdd/sql: upsert on '${schema.name}' needs the primary key value`)
+    end
+    local p = new_params(d)
+    local cols = []
+    local ph = []
+    for _, fname in schema.field_order do
+        if doc[fname] ~= nil then
+            cols[] = d.quote(fname)
+            ph[] = add_param(p, doc[fname], schema.fields[fname])
+        end
+    end
+    return {sql = d.upsert(d.quote(schema.name), cols, ph, d.quote(pk)), params = p.values}
+end
+
 -- sql.update(schema, plan, changes, d) → {sql, params} | error
 -- A dotted key ("endereco.cidade") changes one value inside a document column.
 function M.update(schema, plan, changes, d)
@@ -449,6 +491,14 @@ function Conn.insert(self, schema, doc)
     if pk ~= nil and out[pk] == nil and type(self.db.last_insert_id) == "function" then
         out[pk] = self.db:last_insert_id()
     end
+    return out
+end
+
+function Conn.upsert(self, schema, doc)
+    local st = M.upsert(schema, doc, self.dialect)?
+    local _ = self.db:exec(st.sql, st.params)?
+    local out = {}
+    for k, v in doc do out[k] = v end
     return out
 end
 

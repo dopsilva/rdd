@@ -122,13 +122,18 @@ function Model.delete_by_id(self, id)
 end
 
 -- model:save(doc) → saved_doc | error
--- Inserts if primary key is nil or not found; updates otherwise.
+-- Inserts if primary key is nil or not found; updates otherwise. With a
+-- driver that has upsert(), that is one statement; otherwise a lookup, then
+-- an insert or an update.
 function Model.save(self, doc)
     local pk = self.schema.primary_key
     if pk == nil or doc == nil or doc[pk] == nil then
         return self:insert(doc)
     end
     local valid = self.schema:validate(doc)?
+    if type(self.conn.upsert) == "function" then
+        return self.conn:upsert(self.schema, valid)
+    end
     local pk_val = valid[pk]
     local exists = self:where(pk, pk_val):exists()?
     if not exists then
