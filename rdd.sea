@@ -181,7 +181,10 @@ function Model.project(self, ...)
     local q = self:query()
     return q.project(q, ...)
 end
-function Model.order_by(self, field, dir) return self:query():order_by(field, dir) end
+function Model.order_by(self, ...)
+    local q = self:query()
+    return q.order_by(q, ...)
+end
 function Model.limit(self, n) return self:query():limit(n) end
 function Model.offset(self, n) return self:query():offset(n) end
 function Model.all(self) return self:query():all() end

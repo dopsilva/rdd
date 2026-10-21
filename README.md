@@ -102,6 +102,15 @@ q:where(rdd.raw("lower(nome) = ?", "ana"))     -- SQL cru (veja "SQL cru")
 
 O operador aceita qualquer caixa e espaços (`"NOT IN"`, `"starts with"`).
 
+`order_by` aceita várias chaves de uma vez, na ordem de prioridade:
+
+```sea
+q:order_by("-saldo", "nome")          -- "-campo" decrescente; "campo" ou "+campo" crescente
+q:order_by("saldo desc, nome")        -- estilo SQL, numa string só
+q:order_by(["-saldo", "nome"])        -- um array
+q:order_by("nome", "desc")            -- um campo e a direção
+```
+
 Na expressão: `campo op valor` com `=`, `==`, `!=`, `<>`, `<`, `<=`, `>`, `>=`, `like`, `ilike`, `contains`, `starts_with`, `ends_with`; `campo [not] in ('a', 'b')` ou `campo [not] in ?` (um array); `campo between 1 and 9`; `campo is [not] null`. Valores: `?`, `'texto'` (`''` para uma aspa), números, `true`, `false`. `and` liga mais forte que `or`, parênteses agrupam, palavras-chave em qualquer caixa. A expressão pode ser combinada com as outras chamadas (`where`, `or_where`, grupos com função). Um campo com ponto é um caminho em sub-documento (`endereco.uf`) ou, depois de um `join`, um campo da tabela juntada pelo seu apelido (`p.valor`, veja abaixo).
 
 **Precedência:** numa cadeia que mistura `where` e `or_where`, vale a do SQL: `where(a):or_where(b):where(c)` é `a or (b and c)`. O plano entregue ao driver deixa isso explícito (cada trecho de `and` vira um grupo), então todo driver avalia igual, seja concatenando SQL ou avaliando da esquerda para a direita.

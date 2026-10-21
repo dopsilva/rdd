@@ -153,8 +153,7 @@ local function main()
     local por_cliente = clientes:left_join(Pedidos, "o", "o.cliente_id = id")
         :group_by("nome")
         :aggregate({pedidos = "count(o.id)", gasto = "sum(o.total)"})
-        :order_by("-gasto")
-        :order_by("nome")
+        :order_by("-gasto", "nome")
         :all()?
     for _, r in por_cliente do printf("  %-8s %d pedido(s)  R$ %8.2f\n", r.nome, r.pedidos, r.gasto or 0.0) end
 

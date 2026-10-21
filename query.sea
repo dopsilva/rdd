@@ -642,8 +642,8 @@ function Query.project(self, ...)
     return self.fields(self, ...)
 end
 
--- q:order_by(field [, "asc"|"desc"]) — also accepts "-field" for desc
-function Query.order_by(self, field, dir)
+-- adds one sort key: field [, "asc"|"desc"], or "-field" for desc
+local function add_order(self, field, dir)
     if self._err ~= nil then return self end
     if type(field) ~= "string" or string.trim(field) == "" then
         self._err = error("rdd: order_by field must be a non-empty string")
@@ -679,6 +679,42 @@ function Query.order_by(self, field, dir)
         end
     end
     self._orders[] = {field = field, dir = dir}
+    return self
+end
+
+local DIRS = {asc = true, desc = true}
+
+-- q:order_by(...) — one or more sort keys, in priority order:
+--   order_by("-total", "nome")            "-field" descending, "+field" or "field" ascending
+--   order_by("total desc, nome")          SQL style, in one string
+--   order_by(["-total", "nome"])          an array
+--   order_by("nome", "desc")              a field and its direction
+function Query.order_by(self, ...)
+    if self._err ~= nil then return self end
+    local args = [...]
+    if len(args) == 1 and type(args[0]) == "array" then args = args[0] end
+    if len(args) == 2 and type(args[1]) == "string" and DIRS[string.lower(string.trim(args[1]))] then
+        return add_order(self, args[0], args[1])
+    end
+    if len(args) == 0 then
+        self._err = error("rdd: order_by() needs at least one field")
+        return self
+    end
+    for _, a in args do
+        if type(a) ~= "string" then
+            self._err = error(`rdd: order_by() takes field names, got ${type(a)}`)
+            return self
+        end
+        for _, part in string.split(a, ",") do
+            local m = re.captures("^\\s*(\\S+)(?:\\s+((?i)asc|desc))?\\s*$", part)
+            if m == nil then
+                self._err = error(`rdd: order_by '${a}': expected field, -field or 'field asc|desc'`)
+                return self
+            end
+            add_order(self, m[1], m[2])
+            if self._err ~= nil then return self end
+        end
+    end
     return self
 end
 
