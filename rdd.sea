@@ -193,6 +193,8 @@ function Model.group_by(self, ...)
     return q.group_by(q, ...)
 end
 function Model.aggregate(self, specs) return self:query():aggregate(specs) end
+function Model.join(self, target, alias, on) return self:query():join(target, alias, on) end
+function Model.left_join(self, target, alias, on) return self:query():left_join(target, alias, on) end
 function Model.sum(self, field) return self:query():sum(field) end
 function Model.avg(self, field) return self:query():avg(field) end
 function Model.min(self, field) return self:query():min(field) end

@@ -42,6 +42,14 @@ local Clientes = rdd.schema("clientes", {
     },
 })
 
+local Pedidos = rdd.schema("pedidos", {
+    id = {type = "int", primary_key = true, auto = true},
+    cliente_id = {type = "int", required = true},
+    produto = {type = "string", required = true},
+    valor = "number",
+    pago = {type = "bool", default_val = false},
+})
+
 t.describe("rdd driver registry", function()
     t.it("registers, lists, and unregisters drivers", function()
         t.is_error(rdd.register_driver("", {}), "non-empty string")
@@ -439,6 +447,69 @@ t.describe("rdd end-to-end with registered SQLite driver", function()
         t.is_error(model:aggregate({x = "sum(peso)"}):all(), "unknown field")
         t.is_error(model:group_by("nome"):all(), "needs aggregate()")
         t.is_error(model:paginate(0, 10), "paginate")
+    end)
+
+    t.it("joins, in SQL and in the in-memory fallback", function()
+        t.no_error(db:migrate(Pedidos))
+        local pedidos = db:model(Pedidos)
+        local _ = t.no_error(model:insert_many([
+            {nome = "Ana", saldo = 10.0, endereco = {rua = "R", cidade = "Santos", uf = "SP"}},
+            {nome = "Bia", saldo = 20.0, endereco = {rua = "R", cidade = "Rio", uf = "RJ"}},
+            {nome = "Caio", saldo = 30.0, endereco = {rua = "R", cidade = "Campinas", uf = "SP"}},
+        ]))
+        _ = t.no_error(pedidos:insert_many([
+            {cliente_id = 1, produto = "Mouse", valor = 50.0, pago = true},
+            {cliente_id = 1, produto = "Monitor", valor = 900.0},
+            {cliente_id = 2, produto = "Teclado", valor = 200.0, pago = true},
+        ]))
+        local function check()
+            -- inner join, filtered on both tables, ordered by a joined field
+            local rows = t.no_error(model:join(Pedidos, "p", "p.cliente_id = id")
+                :where("p.valor > ? and endereco.uf = ?", 40, "SP"):order_by("-p.valor"):all())
+            t.eq(len(rows), 2)
+            t.eq(rows[0].nome, "Ana")
+            t.eq(rows[0].p.produto, "Monitor")
+            t.eq(rows[0].p.pago, false)
+            t.eq(rows[1].p.produto, "Mouse")
+
+            -- left join keeps Caio, with no pedido; aggregates over the join
+            rows = t.no_error(model:left_join(pedidos, "p", "p.cliente_id = id")
+                :group_by("nome"):aggregate({n = "count(p.id)", total = "sum(p.valor)"})
+                :order_by("nome"):all())
+            t.eq(len(rows), 3)
+            t.eq(rows[0].total, 950.0)
+            t.eq(rows[1].n, 1)
+            t.eq(rows[2].nome, "Caio")
+            t.eq(rows[2].n, 0)
+            t.is_nil(rows[2].total)
+
+            rows = t.no_error(model:left_join(Pedidos, "p", "p.cliente_id = id")
+                :where("p.id", nil):fields("nome", "p.produto"):all())
+            t.eq(len(rows), 1)
+            t.eq(rows[0].nome, "Caio")
+            t.is_nil(rows[0].p)
+            t.is_nil(rows[0].saldo)
+
+            rows = t.no_error(model:join(Pedidos, "p", "p.cliente_id = id")
+                :where("p.pago", true):or_where("nome", "Ana"):fields("nome", "p"):order_by("p.valor"):all())
+            t.eq(len(rows), 3)
+            t.eq(rows[0].p.produto, "Mouse")
+            t.eq(rows[2].p.valor, 900.0)
+            t.eq(rows[2].p.cliente_id, 1)
+
+            t.eq(t.no_error(model:join(Pedidos, "p", "p.cliente_id = id"):count()), 3)
+            t.eq(t.no_error(model:join(Pedidos, "p", "p.cliente_id = id"):sum("p.valor")), 1150.0)
+        end
+        t.eq(model.conn.joins, true)
+        check()
+        model.conn.joins = false
+        check()
+
+        t.is_error(model:join(Pedidos, "p", "p.cliente = id"):all(), "unknown field 'pedidos.cliente'")
+        t.is_error(model:join(Pedidos, "nome", "nome.cliente_id = id"):all(), "already a field")
+        t.is_error(model:join(Pedidos, "p", "p.cliente_id > id"):all(), "expected field = field")
+        t.is_error(model:where("p.valor", 1):join(Pedidos, "p", "p.cliente_id = id"):all(), "unknown field")
+        t.is_error(model:join(Pedidos, "p", "p.cliente_id = id"):where("p.pago", true):delete(), "does not take joins")
     end)
 
     t.it("saves with upsert and with the lookup fallback", function()

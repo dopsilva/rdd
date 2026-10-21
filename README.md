@@ -5,7 +5,7 @@ O **RDD** é uma camada de abstração de dados e ORM/ODM para a linguagem **Sea
 O RDD cuida de:
 1. **Registro e validação de contrato de drivers** (`rdd.register_driver`).
 2. **Definição e validação de Schemas** (`rdd.schema`), suportando tanto modelos tabulares quanto documentos encadeados (`document`, `array` de sub-documentos, `map`, etc.), valores padrão (`default_val`), campos gerados (`auto`) e validação de tipos.
-3. **Query Builder Fluente** (`where`, `or_where`, `where_in`, `where_between`, `fields`, `order_by`, `limit`, `offset`, `group_by`/`aggregate`, `paginate`), gerando um **Query Plan (AST)** abstrato que é repassado junto com o `Schema` e o documento bruto para o driver registrado.
+3. **Query Builder Fluente** (`where`, `or_where`, `where_in`, `where_between`, `fields`, `order_by`, `limit`, `offset`, `join`/`left_join`, `group_by`/`aggregate`, `paginate`), gerando um **Query Plan (AST)** abstrato que é repassado junto com o `Schema` e o documento bruto para o driver registrado.
 
 ---
 
@@ -86,7 +86,7 @@ local pedidos = clientes:where("(endereco.uf = ? or endereco.uf = ?) and saldo >
     :all()?
 ```
 
-Na expressão: `campo op valor` com `=`, `==`, `!=`, `<>`, `<`, `<=`, `>`, `>=`, `like`, `ilike`, `contains`, `starts_with`, `ends_with`; `campo [not] in ('a', 'b')` ou `campo [not] in ?` (um array); `campo between 1 and 9`; `campo is [not] null`. Valores: `?`, `'texto'` (`''` para uma aspa), números, `true`, `false`. `and` liga mais forte que `or`, parênteses agrupam, palavras-chave em qualquer caixa. A expressão pode ser combinada com as outras chamadas (`where`, `or_where`, grupos com função). Um campo com ponto é um caminho em sub-documento (`endereco.uf`); não há apelidos de tabela (`A.CAMPO`) nem joins.
+Na expressão: `campo op valor` com `=`, `==`, `!=`, `<>`, `<`, `<=`, `>`, `>=`, `like`, `ilike`, `contains`, `starts_with`, `ends_with`; `campo [not] in ('a', 'b')` ou `campo [not] in ?` (um array); `campo between 1 and 9`; `campo is [not] null`. Valores: `?`, `'texto'` (`''` para uma aspa), números, `true`, `false`. `and` liga mais forte que `or`, parênteses agrupam, palavras-chave em qualquer caixa. A expressão pode ser combinada com as outras chamadas (`where`, `or_where`, grupos com função). Um campo com ponto é um caminho em sub-documento (`endereco.uf`) ou, depois de um `join`, um campo da tabela juntada pelo seu apelido (`p.valor`, veja abaixo).
 
 **Precedência:** numa cadeia que mistura `where` e `or_where`, vale a do SQL: `where(a):or_where(b):where(c)` é `a or (b and c)`. O plano entregue ao driver deixa isso explícito (cada trecho de `and` vira um grupo), então todo driver avalia igual, seja concatenando SQL ou avaliando da esquerda para a direita.
 
@@ -105,6 +105,44 @@ local removidos = clientes:where("ativo", false):delete()?
 -- Inserir ou atualizar pela chave primária (num comando só se o driver tem upsert)
 local salvo = clientes:save({id = 7, nome = "Maria", email = "maria@example.com"})?
 ```
+
+### Joins
+
+```sea
+local Pedidos = rdd.schema("pedidos", {
+    id = {type = "int", primary_key = true, auto = true},
+    cliente_id = "int",
+    produto = "string",
+    valor = "number",
+})
+
+-- join(schema ou model, apelido, "condição"): os campos de pedidos viram p.campo
+local grandes = clientes:join(Pedidos, "p", "p.cliente_id = id")
+    :where("p.valor > ? and endereco.uf = ?", 500, "SP")
+    :order_by("-p.valor")
+    :all()?
+-- grandes[0] → {id = 1, nome = "Ana", ..., p = {id = 2, produto = "Monitor", valor = 900.0, ...}}
+
+-- left_join mantém quem não tem par (doc.p fica nil); combina com agregações
+local vendas = clientes:left_join(Pedidos, "p", "p.cliente_id = id")
+    :group_by("nome")
+    :aggregate({pedidos = "count(p.id)", total = "sum(p.valor)"})
+    :order_by("-total")
+    :all()?
+
+-- quem nunca comprou
+local sem_pedido = clientes:left_join(Pedidos, "p", "p.cliente_id = id"):where("p.id", nil):all()?
+```
+
+**Como funciona:**
+- **Condição:** igualdades entre campos, ligadas por `and` (`"p.cliente_id = id and p.loja = loja"`). Um campo sem apelido é da tabela da query.
+- **Vários joins:** dá para encadear quantos quiser; cada `on` pode citar os apelidos anteriores.
+- **Onde o apelido vale:** depois do `join`, ele pode ser usado em `where` (inclusive em expressões), `order_by`, `group_by`, `aggregate` e `fields`. Em `fields`, o apelido sozinho (`fields("nome", "p")`) traz o documento juntado inteiro.
+- **Restrições:** o apelido não pode repetir o nome de um campo da query, e o `join` precisa vir antes das chamadas que usam o apelido. `update` e `delete` não aceitam joins.
+
+**Quem executa:**
+- Um driver que declara `conn.joins = true` recebe `plan.joins` (`[{kind = "inner"|"left", alias, collection, schema, on = [{left, right}]}]`) e faz o join no banco. É o caso do `rdd.sql`, que gera `INNER JOIN`/`LEFT JOIN` com todas as colunas qualificadas.
+- Para os outros drivers, o RDD lê cada tabela com `find`, junta em memória e aplica filtros, ordem, paginação e agregações. Os filtros que tocam só uma tabela seguem para o `find` dela antes do join, para ler menos.
 
 ### Agregações e paginação
 

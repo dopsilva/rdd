@@ -19,6 +19,8 @@
 -- are quoted; LIKE patterns built by contains/starts_with/ends_with escape
 -- their own % and _.
 
+local query = require("./query")
+
 local M = {}
 
 local function is_record(v)
@@ -210,12 +212,44 @@ local function add_param(p, v, f)
     return p.d.placeholder(len(p.values))
 end
 
--- sql.column(schema, path, d) → SQL for a field path ("nome", "endereco.uf")
-function M.column(schema, path, d)
-    local parts = string.split(path, ".")
+-- What field paths refer to in a statement: the query's schema and, with
+-- joins, the joined schemas by alias. With joins every column is qualified
+-- (the base table by its name, a joined one by its alias).
+local function scope(schema, plan, d)
+    local s = {}
+    s.schema = schema
+    s.joins = plan and plan.joins or nil
+    s.qualify = s.joins ~= nil
+    s.base = d.quote(plan and plan.collection or schema.name)
+    return s
+end
+
+local function col_of(S, path, d)
+    local j, _, rest = query.resolve(S.joins, S.schema, path)
+    local parts = string.split(rest, ".")
     local col = d.quote(parts[0])
+    if S.qualify then col = (j ~= nil and d.quote(j.alias) or S.base) .. "." .. col end
     if len(parts) == 1 then return col end
     return d.json_get(col, list.slice(parts, 1))
+end
+
+local function field_in(S, path)
+    local _, sch, rest = query.resolve(S.joins, S.schema, path)
+    if sch == nil then return nil end
+    return sch:field_at(rest)
+end
+
+-- sql.column(schema, path, d [, plan]) → SQL for a field path ("nome",
+-- "endereco.uf", with joins "p.valor")
+function M.column(schema, path, d, plan)
+    return col_of(scope(schema, plan, d), path, d)
+end
+
+-- sql.field_at(schema, plan, path) → the field definition a path names
+function M.field_at(schema, plan, path)
+    local _, sch, rest = query.resolve(plan and plan.joins or nil, schema, path)
+    if sch == nil then return nil end
+    return sch:field_at(rest)
 end
 
 local function field_of(schema, path)
@@ -231,10 +265,10 @@ end
 
 local CMP = {["="] = "=", ["=="] = "=", ["!="] = "<>", ["<>"] = "<>", ["<"] = "<", ["<="] = "<=", [">"] = ">", [">="] = ">="}
 
-local function compile_cond(schema, node, p)
+local function compile_cond(S, node, p)
     local d = p.d
-    local col = M.column(schema, node.field, d)
-    local f = field_of(schema, node.field)
+    local col = col_of(S, node.field, d)
+    local f = field_in(S, node.field)
     local op = node.op
     local v = node.value
     if CMP[op] ~= nil then
@@ -268,15 +302,15 @@ local function compile_cond(schema, node, p)
     return error(`rdd/sql: operator '${tostring(op)}' is not supported`)
 end
 
-local function compile_filters(schema, filters, p)
+local function compile_filters(S, filters, p)
     local out = []
     for _, node in filters do
         local s
         if node.kind == "group" then
-            s = compile_filters(schema, node.filters, p)?
+            s = compile_filters(S, node.filters, p)?
             if s ~= "" then s = `(${s})` end
         else
-            s = compile_cond(schema, node, p)?
+            s = compile_cond(S, node, p)?
         end
         if s ~= "" then
             if len(out) > 0 then out[] = (node.logic == "or") and " OR " or " AND " end
@@ -286,8 +320,8 @@ local function compile_filters(schema, filters, p)
     return string.join(out, "")
 end
 
-local function where_clause(schema, plan, p)
-    local w = compile_filters(schema, plan.filters or [], p)?
+local function where_clause(S, plan, p)
+    local w = compile_filters(S, plan.filters or [], p)?
     return w ~= "" and ` WHERE ${w}` or ""
 end
 
@@ -296,32 +330,71 @@ end
 -- values are appended to `params`, and placeholders number on from the
 -- parameters already there.
 function M.where(schema, filters, d, params)
-    return compile_filters(schema, filters, {d = d, values = params})
+    return compile_filters(scope(schema, nil, d), filters, {d = d, values = params})
 end
 
-local function table_name(plan, schema, d)
-    return d.quote(plan.collection or schema.name)
+-- FROM with the joins: "t" INNER JOIN "u" AS "p" ON "p"."k" = "t"."id" ...
+local function from_clause(S, plan, d)
+    local s = S.base
+    for _, j in plan.joins or [] do
+        local conds = []
+        for _, c in j.on do conds[] = `${col_of(S, c.left, d)} = ${col_of(S, c.right, d)}` end
+        local kw = j.kind == "left" and "LEFT JOIN" or "INNER JOIN"
+        s ..= ` ${kw} ${d.quote(j.collection or j.schema.name)} AS ${d.quote(j.alias)} ON ${string.join(conds, " AND ")}`
+    end
+    return s
 end
 
-local function order_clause(schema, plan, d)
+local function order_clause(S, plan, d)
     if plan.orders == nil or len(plan.orders) == 0 then return "" end
     local ord = []
     for _, o in plan.orders do
-        ord[] = `${M.column(schema, o.field, d)} ${string.upper(o.dir or "asc")}`
+        ord[] = `${col_of(S, o.field, d)} ${string.upper(o.dir or "asc")}`
     end
     return ` ORDER BY ${string.join(ord, ", ")}`
 end
 
--- The columns a projection reads: nested paths read their root column.
-local function select_list(plan, d)
-    if plan.fields == nil or len(plan.fields) == 0 then return "*" end
+local function join_named(S, name)
+    for _, j in S.joins or [] do
+        if j.alias == name then return j end
+    end
+    return nil
+end
+
+-- The columns a find reads. Without joins: * or the projected root columns.
+-- With joins, each column is qualified and named "field" for the query's
+-- schema and "alias.field" for a joined one (sql.hydrate splits them back).
+local function select_list(S, plan, d)
+    local projected = plan.fields ~= nil and len(plan.fields) > 0
+    if not S.qualify and not projected then return "*" end
     local seen = [=]
     local cols = []
+    local function add(qual, prefix, root)
+        local name = prefix .. root
+        if seen[name] then return end
+        seen[name] = true
+        cols[] = S.qualify and `${qual}.${d.quote(root)} AS ${d.quote(name)}` or d.quote(root)
+    end
+    local function add_all(qual, prefix, sch)
+        for _, f in sch.field_order do add(qual, prefix, f) end
+    end
+    if not projected then
+        add_all(S.base, "", S.schema)
+        for _, j in S.joins do add_all(d.quote(j.alias), j.alias .. ".", j.schema) end
+        return string.join(cols, ", ")
+    end
     for _, path in plan.fields do
-        local root = string.split(path, ".")[0]
-        if not seen[root] then
-            seen[root] = true
-            cols[] = d.quote(root)
+        local whole = join_named(S, path)
+        if whole ~= nil then
+            add_all(d.quote(whole.alias), whole.alias .. ".", whole.schema)
+        else
+            local j, _, rest = query.resolve(S.joins, S.schema, path)
+            local root = string.split(rest, ".")[0]
+            if j ~= nil then
+                add(d.quote(j.alias), j.alias .. ".", root)
+            else
+                add(S.base, "", root)
+            end
         end
     end
     return string.join(cols, ", ")
@@ -331,10 +404,11 @@ end
 
 -- sql.find(schema, plan, d) → {sql, params} | error
 function M.find(schema, plan, d)
+    local S = scope(schema, plan, d)
     local p = new_params(d)
-    local s = `SELECT ${select_list(plan, d)} FROM ${table_name(plan, schema, d)}`
-    s ..= where_clause(schema, plan, p)?
-    local ord = order_clause(schema, plan, d)
+    local s = `SELECT ${select_list(S, plan, d)} FROM ${from_clause(S, plan, d)}`
+    s ..= where_clause(S, plan, p)?
+    local ord = order_clause(S, plan, d)
     s ..= ord
     s = d.paging(s, plan.limit, plan.offset, ord ~= "")
     return {sql = s, params = p.values}
@@ -344,26 +418,27 @@ end
 -- For a plan with aggregates: one row per group_by combination, columns named
 -- after the group fields and the aggregates; orders may name an aggregate.
 function M.aggregate(schema, plan, d)
+    local S = scope(schema, plan, d)
     local p = new_params(d)
     local cols = []
     local groups = []
     for _, f in plan.group_by do
-        local e = M.column(schema, f, d)
+        local e = col_of(S, f, d)
         groups[] = e
         cols[] = `${e} AS ${d.quote(f)}`
     end
     local names = [=]
     for _, a in plan.aggregates do
-        local arg = a.field == nil and "*" or M.column(schema, a.field, d)
+        local arg = a.field == nil and "*" or col_of(S, a.field, d)
         cols[] = `${string.upper(a.fn)}(${arg}) AS ${d.quote(a.name)}`
         names[a.name] = true
     end
-    local s = `SELECT ${string.join(cols, ", ")} FROM ${table_name(plan, schema, d)}`
-    s ..= where_clause(schema, plan, p)?
+    local s = `SELECT ${string.join(cols, ", ")} FROM ${from_clause(S, plan, d)}`
+    s ..= where_clause(S, plan, p)?
     if len(groups) > 0 then s ..= ` GROUP BY ${string.join(groups, ", ")}` end
     local ord = []
     for _, o in plan.orders or [] do
-        local e = names[o.field] and d.quote(o.field) or M.column(schema, o.field, d)
+        local e = names[o.field] and d.quote(o.field) or col_of(S, o.field, d)
         ord[] = `${e} ${string.upper(o.dir or "asc")}`
     end
     if len(ord) > 0 then s ..= ` ORDER BY ${string.join(ord, ", ")}` end
@@ -373,9 +448,10 @@ end
 
 -- sql.count(schema, plan, d) → {sql, params} | error (limit/offset respected)
 function M.count(schema, plan, d)
+    local S = scope(schema, plan, d)
     local p = new_params(d)
-    local from = table_name(plan, schema, d)
-    local w = where_clause(schema, plan, p)?
+    local from = from_clause(S, plan, d)
+    local w = where_clause(S, plan, p)?
     if plan.limit == nil and plan.offset == nil then
         return {sql = `SELECT COUNT(*) FROM ${from}${w}`, params = p.values}
     end
@@ -429,6 +505,7 @@ end
 -- sql.update(schema, plan, changes, d) → {sql, params} | error
 -- A dotted key ("endereco.cidade") changes one value inside a document column.
 function M.update(schema, plan, changes, d)
+    if plan.joins ~= nil then return error("rdd/sql: update and delete do not take joins") end
     local p = new_params(d)
     local sets = []
     for _, k in list.keys(changes) do
@@ -443,16 +520,19 @@ function M.update(schema, plan, changes, d)
         end
     end
     if len(sets) == 0 then return error("rdd/sql: update without changes") end
-    local s = `UPDATE ${table_name(plan, schema, d)} SET ${string.join(sets, ", ")}`
-    s ..= where_clause(schema, plan, p)?
+    local S = scope(schema, plan, d)
+    local s = `UPDATE ${S.base} SET ${string.join(sets, ", ")}`
+    s ..= where_clause(S, plan, p)?
     return {sql = s, params = p.values}
 end
 
 -- sql.delete(schema, plan, d) → {sql, params} | error
 function M.delete(schema, plan, d)
+    if plan.joins ~= nil then return error("rdd/sql: update and delete do not take joins") end
     local p = new_params(d)
-    local s = `DELETE FROM ${table_name(plan, schema, d)}`
-    s ..= where_clause(schema, plan, p)?
+    local S = scope(schema, plan, d)
+    local s = `DELETE FROM ${S.base}`
+    s ..= where_clause(S, plan, p)?
     return {sql = s, params = p.values}
 end
 
@@ -475,26 +555,54 @@ function M.create_table(schema, d)
     return d.create_table(d.quote(schema.name), schema.name, string.join(cols, ", "))
 end
 
--- sql.hydrate(schema, row, fields, d) → document
--- Turns a result row back into a document: the schema's fields (or the
--- projected ones), bools and JSON columns decoded by d.read.
-function M.hydrate(schema, row, fields, d)
-    if row == nil then return nil end
-    local out = {}
-    local cols = schema.field_order
-    if fields ~= nil and len(fields) > 0 then
-        cols = []
-        local seen = [=]
-        for _, path in fields do
-            local root = string.split(path, ".")[0]
-            if not seen[root] then
-                seen[root] = true
-                cols[] = root
+-- The root columns read for one table (alias nil: the query's own schema):
+-- all of them without a projection, or when the projection names the join's
+-- alias alone; else the projected roots that belong to that table.
+local function hydrate_cols(sch, fields, joins, alias)
+    if fields == nil or len(fields) == 0 then return sch.field_order end
+    local S = {}
+    S.joins = joins
+    local cols = []
+    local seen = [=]
+    for _, path in fields do
+        local whole = join_named(S, path)
+        if whole ~= nil then
+            if whole.alias == alias then return sch.field_order end
+        else
+            local j, _, rest = query.resolve(joins, nil, path)
+            if (j == nil and alias == nil) or (j ~= nil and j.alias == alias) then
+                local root = string.split(rest, ".")[0]
+                if not seen[root] then
+                    seen[root] = true
+                    cols[] = root
+                end
             end
         end
     end
-    for _, fname in cols do
+    return cols
+end
+
+-- sql.hydrate(schema, row, fields, d [, plan]) → document
+-- Turns a result row back into a document: the schema's fields (or the
+-- projected ones), bools and JSON columns decoded by d.read. With the plan's
+-- joins, the "alias.field" columns become doc[alias] (left out when a left
+-- join found no match).
+function M.hydrate(schema, row, fields, d, plan)
+    if row == nil then return nil end
+    local joins = plan and plan.joins or nil
+    local out = {}
+    for _, fname in hydrate_cols(schema, fields, joins, nil) do
         out[fname] = d.read(row[fname], schema:field(fname))
+    end
+    for _, j in joins or [] do
+        local sub = {}
+        local found = false
+        for _, fname in hydrate_cols(j.schema, fields, joins, j.alias) do
+            local v = row[j.alias .. "." .. fname]
+            if v ~= nil then found = true end
+            sub[fname] = d.read(v, j.schema:field(fname))
+        end
+        if found then out[j.alias] = sub end
     end
     return out
 end
@@ -537,7 +645,7 @@ function Conn.find(self, schema, plan)
     local st = M.find(schema, plan, self.dialect)?
     local rows = self.db:query(st.sql, st.params)?
     local out = []
-    for _, r in rows do out[] = M.hydrate(schema, r, plan.fields, self.dialect) end
+    for _, r in rows do out[] = M.hydrate(schema, r, plan.fields, self.dialect, plan) end
     return out
 end
 
@@ -553,11 +661,11 @@ function Conn.aggregate(self, schema, plan)
     local out = []
     for _, r in rows do
         local row = {}
-        for _, f in plan.group_by do row[f] = d.read(r[f], schema:field_at(f)) end
+        for _, f in plan.group_by do row[f] = d.read(r[f], M.field_at(schema, plan, f)) end
         for _, a in plan.aggregates do
             local v = r[a.name]
             -- min/max of a bool or JSON field come back in the column's encoding
-            if (a.fn == "min" or a.fn == "max") and a.field ~= nil then v = d.read(v, schema:field_at(a.field)) end
+            if (a.fn == "min" or a.fn == "max") and a.field ~= nil then v = d.read(v, M.field_at(schema, plan, a.field)) end
             row[a.name] = v
         end
         out[] = row
@@ -598,6 +706,7 @@ function M.connection(db, d)
     local c = {}
     c.db = db
     c.dialect = d or M.dialects.sqlite
+    c.joins = true -- find/count/aggregate compile plan.joins
     for k, f in Conn do c[k] = f end
     return c
 end

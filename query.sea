@@ -22,6 +22,11 @@
 --       aggregates = [{name = "total", fn = "sum", field = "saldo"}],  -- field nil: count(*)
 -- and the query returns one row per group; limit, offset and orders (which
 -- may name an aggregate) then apply to the groups.
+--
+-- After join()/left_join() it has
+--       joins = [{kind = "inner", alias = "p", collection = "pedidos", schema = <Schema>,
+--                 on = [{left = "p.cliente_id", right = "id"}]}],
+-- and paths starting with an alias ("p.valor") name the joined schema's fields.
 
 local M = {}
 
@@ -56,13 +61,29 @@ local function with_methods(obj, methods)
     return obj
 end
 
-local function check_field(schema, field_path)
+-- resolve(joins, schema, path) → join | nil, schema, path inside that schema
+-- A path starting with a join's alias ("p.valor") names a field of the
+-- joined schema; any other path is a field of the query's own schema.
+local function resolve(joins, schema, path)
+    local dot = string.find(path, ".")
+    if dot ~= nil and joins ~= nil then
+        local alias = string.sub(path, 1, dot - 1)
+        for _, j in joins do
+            if j.alias == alias then return j, j.schema, string.sub(path, dot + 1) end
+        end
+    end
+    return nil, schema, path
+end
+M.resolve = resolve
+
+local function check_field(q, field_path)
     if type(field_path) ~= "string" or string.trim(field_path) == "" then
         return error("rdd: query field name must be a non-empty string")
     end
+    local _, schema, path = resolve(q._joins, q.schema, field_path)
     if schema ~= nil and not schema.allow_extra then
-        if schema:field_at(field_path) == nil then
-            return error(`rdd: unknown field '${schema.name}.${field_path}' in query`)
+        if schema:field_at(path) == nil then
+            return error(`rdd: unknown field '${schema.name}.${path}' in query`)
         end
     end
     return true
@@ -92,6 +113,7 @@ local function add_condition(q, logic, a, b, c, nargs)
     -- Grouped sub-query: q:where(function(sub) ... end)
     if nargs == 1 and type(a) == "function" then
         local sub = M.new(q.schema, q.conn)
+        sub._joins = q._joins
         local r = a(sub)
         if is_error(r) then
             q._err = r
@@ -143,7 +165,7 @@ local function add_condition(q, logic, a, b, c, nargs)
         return q
     end
 
-    local ok = check_field(q.schema, field)
+    local ok = check_field(q, field)
     if is_error(ok) then
         q._err = ok
         return q
@@ -443,7 +465,78 @@ function Query.clone(self)
     c._offset = self._offset
     for _, f in self._group do c._group[] = f end
     for _, a in self._aggs do c._aggs[] = a end
+    for _, j in self._joins do c._joins[] = j end
     return c
+end
+
+local function is_alias(q, name)
+    for _, j in q._joins do
+        if j.alias == name then return true end
+    end
+    return false
+end
+
+-- "p.cliente_id = id and p.loja = loja" → [{left, right}], each side a field
+-- path checked against the query's schema or a join (the new one included)
+local function parse_on(q, on)
+    if type(on) ~= "string" then
+        return error("rdd: join condition must be a string like \"p.cliente_id = id\"")
+    end
+    local out = []
+    for _, part in re.split("(?i)\\s+and\\s+", string.trim(on)) do
+        local m = re.captures("^\\s*([A-Za-z_][A-Za-z0-9_.]*)\\s*==?\\s*([A-Za-z_][A-Za-z0-9_.]*)\\s*$", part)
+        if m == nil then
+            return error(`rdd: join condition '${on}': expected field = field [and field = field ...]`)
+        end
+        check_field(q, m[1])?
+        check_field(q, m[2])?
+        out[] = {left = m[1], right = m[2]}
+    end
+    return out
+end
+
+local function add_join(self, kind, target, alias, on)
+    if self._err ~= nil then return self end
+    local sch = target
+    if is_record(target) and target.schema ~= nil and not target.__is_schema then sch = target.schema end
+    if not is_record(sch) or not sch.__is_schema then
+        self._err = error("rdd: join() expects a Schema (or a Model) to join")
+        return self
+    end
+    if type(alias) ~= "string" or re.match("^[A-Za-z_][A-Za-z0-9_]*$", alias) == nil then
+        self._err = error(`rdd: join alias must be a plain name, got '${tostring(alias)}'`)
+        return self
+    end
+    if is_alias(self, alias) or (self.schema ~= nil and self.schema:field(alias) ~= nil) then
+        self._err = error(`rdd: join alias '${alias}' is already a field or an alias of this query`)
+        return self
+    end
+    local j = {}
+    j.kind = kind
+    j.alias = alias
+    j.schema = sch
+    j.collection = sch.name
+    self._joins[] = j
+    local conds = parse_on(self, on)
+    if is_error(conds) then
+        self._err = conds
+        return self
+    end
+    j.on = conds
+    return self
+end
+
+-- q:join(schema_or_model, alias, "alias.field = field [and ...]") — inner join
+-- Fields of the joined schema are then named alias.field everywhere (where,
+-- order_by, fields, group_by, aggregate), and each result document carries
+-- the joined document under doc[alias].
+function Query.join(self, target, alias, on)
+    return add_join(self, "inner", target, alias, on)
+end
+
+-- q:left_join(...) — as join(), keeping documents without a match (doc[alias] is nil)
+function Query.left_join(self, target, alias, on)
+    return add_join(self, "left", target, alias, on)
 end
 
 local function where_args(q, logic, args)
@@ -501,7 +594,8 @@ function Query.fields(self, ...)
         args = args[0]
     end
     for _, f in args do
-        local ok = check_field(self.schema, f)
+        -- a join's alias alone projects the whole joined document
+        local ok = is_alias(self, f) or check_field(self, f)
         if is_error(ok) then
             self._err = ok
             return self
@@ -546,7 +640,7 @@ function Query.order_by(self, field, dir)
         if a.name == field then is_agg = true end
     end
     if not is_agg then
-        local ok = check_field(self.schema, field)
+        local ok = check_field(self, field)
         if is_error(ok) then
             self._err = ok
             return self
@@ -562,7 +656,7 @@ function Query.group_by(self, ...)
     local args = [...]
     if len(args) == 1 and type(args[0]) == "array" then args = args[0] end
     for _, f in args do
-        local ok = check_field(self.schema, f)
+        local ok = check_field(self, f)
         if is_error(ok) then
             self._err = ok
             return self
@@ -600,7 +694,7 @@ function Query.aggregate(self, specs)
             end
             field = nil
         else
-            local ok = check_field(self.schema, field)
+            local ok = check_field(self, field)
             if is_error(ok) then
                 self._err = ok
                 return self
@@ -711,6 +805,15 @@ function Query.to_plan(self)
     elseif len(self._group) > 0 then
         return error("rdd: group_by() needs aggregate() to say what each group computes")
     end
+    if len(self._joins) > 0 then
+        local joins = []
+        for _, j in self._joins do
+            local on = []
+            for _, c in j.on do on[] = {left = c.left, right = c.right} end
+            joins[] = {kind = j.kind, alias = j.alias, collection = j.collection, schema = j.schema, on = on}
+        end
+        plan.joins = joins
+    end
     return plan
 end
 
@@ -730,6 +833,27 @@ local function compare(a, b)
     if type(a) == "bool" then a = a and 1 or 0 end
     if type(b) == "bool" then b = b and 1 or 0 end
     return a < b and -1 or 1
+end
+
+-- rows ordered by plan.orders (get(row, field) reads a value), then paged
+local function order_and_page(rows, plan, get)
+    if len(plan.orders) > 0 then
+        sort.sort(rows, function(x, y)
+            for _, o in plan.orders do
+                local c = compare(get(x, o.field), get(y, o.field))
+                if c ~= 0 then
+                    if o.dir == "desc" then return c > 0 end
+                    return c < 0
+                end
+            end
+            return false
+        end)
+    end
+    local from = plan.offset or 0
+    if from == 0 and plan.limit == nil then return rows end
+    local to = plan.limit ~= nil and math.min(from + plan.limit, len(rows)) or len(rows)
+    if from >= to then return [] end
+    return list.slice(rows, from, to)
 end
 
 -- query.aggregate_rows(docs, plan) → rows
@@ -788,23 +912,225 @@ function M.aggregate_rows(docs, plan)
         end
         rows[] = row
     end
-    if len(plan.orders) > 0 then
-        sort.sort(rows, function(x, y)
-            for _, o in plan.orders do
-                local c = compare(x[o.field], y[o.field])
-                if c ~= 0 then
-                    if o.dir == "desc" then return c > 0 end
-                    return c < 0
+    -- aggregate rows are flat: "endereco.uf" is one key
+    return order_and_page(rows, plan, function(r, f) return r[f] end)
+end
+
+-- ---- In-memory evaluation (drivers without joins) ----
+
+local function like_regex(pattern, icase)
+    local rx = re.escape(tostring(pattern))
+    rx = string.replace(rx, "%", ".*")
+    rx = string.replace(rx, "_", ".")
+    return (icase and "(?is)^" or "(?s)^") .. rx .. "$"
+end
+
+local function comparable(a, b)
+    local ta = type(a)
+    local tb = type(b)
+    if ta == tb then return ta ~= "nil" end
+    return (ta == "int" or ta == "number") and (tb == "int" or tb == "number")
+end
+
+local function match_cond(doc, node)
+    local v = get_path(doc, node.field)
+    local op = node.op
+    local x = node.value
+    if op == "is_null" then return v == nil end
+    if op == "is_not_null" then return v ~= nil end
+    -- as in SQL, any other test on a missing value is false
+    if v == nil then return false end
+    if op == "=" then return v == x end
+    if op == "!=" then return v ~= x end
+    if op == "in" then return list.contains(x, v) end
+    if op == "not_in" then return not list.contains(x, v) end
+    if op == "between" then
+        return comparable(v, x[0]) and comparable(v, x[1]) and compare(v, x[0]) >= 0 and compare(v, x[1]) <= 0
+    end
+    if op == "<" or op == "<=" or op == ">" or op == ">=" then
+        if not comparable(v, x) then return false end
+        local c = compare(v, x)
+        if op == "<" then return c < 0 end
+        if op == "<=" then return c <= 0 end
+        if op == ">" then return c > 0 end
+        return c >= 0
+    end
+    local s = tostring(v)
+    if op == "like" then return re.match(like_regex(x, false), s) ~= nil end
+    if op == "ilike" then return re.match(like_regex(x, true), s) ~= nil end
+    if op == "contains" then return string.contains(s, tostring(x)) end
+    if op == "starts_with" then return string.starts_with(s, tostring(x)) end
+    if op == "ends_with" then return string.ends_with(s, tostring(x)) end
+    return false
+end
+
+-- query.match(doc, filters) → bool
+-- Evaluates plan filters (canonical: and/or mixes are grouped) on a document;
+-- for drivers that filter in memory, and the in-memory join.
+function M.match(doc, filters)
+    local result = true
+    for i, node in filters do
+        local v
+        if node.kind == "group" then
+            v = M.match(doc, node.filters)
+        else
+            v = match_cond(doc, node)
+        end
+        if i == 0 then
+            result = v
+        elseif node.logic == "or" then
+            result = result or v
+        else
+            result = result and v
+        end
+    end
+    return result
+end
+
+local function copy_doc(d)
+    local out = {}
+    for k, v in d do out[k] = v end
+    return out
+end
+
+local function simple_plan(schema, filters)
+    local p = {}
+    p.collection = schema.name
+    p.schema = schema
+    p.fields = []
+    p.filters = filters
+    p.orders = []
+    p.limit = nil
+    p.offset = nil
+    return p
+end
+
+-- the join aliases a filter node touches ("" for the query's own schema)
+local function node_aliases(joins, node, out)
+    if node.kind == "group" then
+        for _, n in node.filters do node_aliases(joins, n, out) end
+    else
+        local j = resolve(joins, nil, node.field)
+        out[j and j.alias or ""] = true
+    end
+    return out
+end
+
+local function strip_alias(node, alias)
+    local c = {}
+    c.kind = node.kind
+    c.logic = "and"
+    if node.kind == "group" then
+        c.filters = []
+        for i, n in node.filters do
+            local s = strip_alias(n, alias)
+            s.logic = i == 0 and "and" or n.logic
+            c.filters[] = s
+        end
+    else
+        c.field = string.sub(node.field, len(alias) + 2)
+        c.op = node.op
+        c.value = node.value
+    end
+    return c
+end
+
+-- The filters that can go to one table's find() ahead of the join: top-level
+-- and-terms touching only that table (for a joined table, only an inner
+-- join, where a missing match drops the row anyway). They narrow the reads;
+-- the whole filter still runs on the joined rows.
+local function pushdown(plan, alias)
+    for i, node in plan.filters do
+        if i > 0 and node.logic == "or" then return [] end
+    end
+    local out = []
+    for _, node in plan.filters do
+        local touched = node_aliases(plan.joins, node, [=])
+        local keys = list.keys(touched)
+        if len(keys) == 1 and keys[0] == alias then
+            if alias == "" then
+                out[] = node
+            else
+                out[] = strip_alias(node, alias)
+            end
+        end
+    end
+    return out
+end
+
+local function on_value(row, j, jdoc, path)
+    local prefix = j.alias .. "."
+    if string.starts_with(path, prefix) then return get_path(jdoc, string.sub(path, len(prefix) + 1)) end
+    return get_path(row, path)
+end
+
+-- the projected fields of a joined row: as rdd/sql selects them, a nested
+-- path keeps its whole root field and "p.valor" keeps doc.p.valor
+local function project(row, fields, joins)
+    local out = {}
+    for _, f in fields do
+        local j, _, rest = resolve(joins, nil, f)
+        if j ~= nil then
+            local sub = row[j.alias]
+            if sub ~= nil then
+                if out[j.alias] == nil then out[j.alias] = {} end
+                local root = string.split(rest, ".")[0]
+                out[j.alias][root] = sub[root]
+            end
+        else
+            -- a field of the query's schema, or a join's alias alone
+            local root = string.split(f, ".")[0]
+            out[root] = row[root]
+        end
+    end
+    return out
+end
+
+-- query.join_rows(conn, plan) → array of docs | error
+-- Runs a plan with joins on a driver that only knows find(): reads each
+-- table, joins in memory (nested loops), filters, then aggregates or
+-- orders, pages and projects.
+function M.join_rows(conn, plan)
+    local docs = conn:find(plan.schema, simple_plan(plan.schema, pushdown(plan, "")))?
+    local rows = []
+    for _, d in docs do rows[] = copy_doc(d) end
+    for _, j in plan.joins do
+        local jf = j.kind == "inner" and pushdown(plan, j.alias) or []
+        local jdocs = conn:find(j.schema, simple_plan(j.schema, jf))?
+        local joined = []
+        for _, r in rows do
+            local matched = false
+            for _, jd in jdocs do
+                local ok = true
+                for _, c in j.on do
+                    local a = on_value(r, j, jd, c.left)
+                    local b = on_value(r, j, jd, c.right)
+                    if a == nil or b == nil or a ~= b then
+                        ok = false
+                        break
+                    end
+                end
+                if ok then
+                    local nr = copy_doc(r)
+                    nr[j.alias] = jd
+                    joined[] = nr
+                    matched = true
                 end
             end
-            return false
-        end)
+            if not matched and j.kind == "left" then joined[] = copy_doc(r) end
+        end
+        rows = joined
     end
-    local from = plan.offset or 0
-    if from == 0 and plan.limit == nil then return rows end
-    local to = plan.limit ~= nil and math.min(from + plan.limit, len(rows)) or len(rows)
-    if from >= to then return [] end
-    return list.slice(rows, from, to)
+    local kept = []
+    for _, r in rows do
+        if M.match(r, plan.filters) then kept[] = r end
+    end
+    if plan.aggregates ~= nil then return M.aggregate_rows(kept, plan) end
+    kept = order_and_page(kept, plan, get_path)
+    if len(plan.fields) == 0 then return kept end
+    local out = []
+    for _, r in kept do out[] = project(r, plan.fields, plan.joins) end
+    return out
 end
 
 -- q:ast() — alias for to_plan()
@@ -826,6 +1152,8 @@ end
 function Query.all(self)
     local conn = require_conn(self)?
     local plan = self:to_plan()?
+    -- a driver takes plan.joins only when it says so (conn.joins = true)
+    if plan.joins ~= nil and conn.joins ~= true then return M.join_rows(conn, plan) end
     if plan.aggregates == nil then return conn:find(self.schema, plan) end
     if type(conn.aggregate) == "function" then return conn:aggregate(self.schema, plan) end
     local base = self:clone()
@@ -862,7 +1190,7 @@ end
 function Query.count(self)
     local conn = require_conn(self)?
     local plan = self:to_plan()?
-    if plan.aggregates ~= nil then return len(self:all()?) end
+    if plan.aggregates ~= nil or (plan.joins ~= nil and conn.joins ~= true) then return len(self:all()?) end
     if type(conn.count) == "function" then
         return conn:count(self.schema, plan)
     end
@@ -933,6 +1261,7 @@ end
 function Query.update(self, changes)
     local conn = require_conn(self)?
     local plan = self:to_plan()?
+    if plan.joins ~= nil then return error("rdd: update() does not take joins") end
     local valid_changes = self.schema:validate_changes(changes)?
     return conn:update(self.schema, plan, valid_changes)
 end
@@ -941,6 +1270,7 @@ end
 function Query.delete(self)
     local conn = require_conn(self)?
     local plan = self:to_plan()?
+    if plan.joins ~= nil then return error("rdd: delete() does not take joins") end
     return conn:delete(self.schema, plan)
 end
 
@@ -957,6 +1287,7 @@ function M.new(schema, conn)
     q._offset = nil
     q._group = []
     q._aggs = []
+    q._joins = []
     return with_methods(q, Query)
 end
 
