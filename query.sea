@@ -127,7 +127,11 @@ local function add_condition(q, logic, a, b, c, nargs)
         return q
     end
 
-    if op == "~=" then op = "!=" end
+    if op == "~=" or op == "<>" then op = "!=" end
+    if op == "==" then op = "=" end
+    -- comparing with nil means a null test, so drivers need no special case
+    if val == nil and op == "=" then op = "is_null" end
+    if val == nil and op == "!=" then op = "is_not_null" end
     if type(op) ~= "string" or not VALID_OPS[op] then
         q._err = error(`rdd: invalid query operator '${tostring(op)}'`)
         return q

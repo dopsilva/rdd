@@ -90,6 +90,8 @@ Na expressão: `campo op valor` com `=`, `==`, `!=`, `<>`, `<`, `<=`, `>`, `>=`,
 
 **Precedência:** numa cadeia que mistura `where` e `or_where`, vale a do SQL: `where(a):or_where(b):where(c)` é `a or (b and c)`. O plano entregue ao driver deixa isso explícito (cada trecho de `and` vira um grupo), então todo driver avalia igual, seja concatenando SQL ou avaliando da esquerda para a direita.
 
+**nil:** `where("email", nil)` (ou `email = ?` com `nil`) entra no plano como `is_null`, e `where("email", "!=", nil)` como `is_not_null`.
+
 ```sea
 -- Atualização parcial (suporta campos aninhados via dot-path)
 local afetados = clientes:where("id", novo.id):update({
