@@ -5,7 +5,7 @@ O **RDD** é uma camada de abstração de dados e ORM/ODM para a linguagem **Sea
 O RDD cuida de:
 1. **Registro e validação de contrato de drivers** (`rdd.register_driver`).
 2. **Definição e validação de Schemas** (`rdd.schema`), suportando tanto modelos tabulares quanto documentos encadeados (`document`, `array` de sub-documentos, `map`, etc.), valores padrão (`default_val`), campos gerados (`auto`) e validação de tipos.
-3. **Query Builder Fluente** (`where`/`or_where` com operadores, expressões, grupos e `rdd.raw`, `fields`, `order_by`, `limit`, `offset`, `join`/`left_join`, `group_by`/`aggregate`, `paginate`), gerando um **Query Plan (AST)** abstrato que é repassado junto com o `Schema` e o documento bruto para o driver registrado.
+3. **Query Builder Fluente** (`where`/`and`/`or` com operadores, `in`, `not_in`, `between`, `is_null`, expressões, grupos e `rdd.raw`, `fields`, `order_by`, `limit`, `offset`, `join`/`left_join`, `group_by`/`aggregate`, `paginate`), gerando um **Query Plan (AST)** abstrato que é repassado junto com o `Schema` e o documento bruto para o driver registrado.
 
 ---
 
@@ -71,7 +71,7 @@ local novo = clientes:insert({
 local lista = clientes:where("ativo", true)
     :where("saldo", ">=", 100)
     :where("endereco.uf", "SP")
-    :or_where(function(sub)
+    :or(function(sub)
         sub:where("endereco.uf", "RJ"):where("nome", "in", ["Ana", "Bia"])
     end)
     :order_by("-saldo")
@@ -86,7 +86,21 @@ local pedidos = clientes:where("(endereco.uf = ? or endereco.uf = ?) and saldo >
     :all()?
 ```
 
-Toda condição passa por `where` (ligada com `and`) ou `or_where` (ligada com `or`). Não há um método por operador:
+Os operadores mais comuns têm métodos com o próprio nome, ligados com `and`:
+
+```sea
+clientes:where("ativo", true)
+    :in("uf", ["SP", "RJ"])
+    :not_in("id", [3, 4])
+    :between("saldo", 400, 1500)
+    :is_null("email")                          -- e is_not_null
+    :or(function(g)                            -- or / and: as mesmas formas de where
+        g:where("nome", "Ana"):in("uf", ["PR"])
+    end)
+    :order_by("-saldo", "nome")
+```
+
+`where`, `and` e `or` aceitam todas estas formas (`where` e `and` ligam com `and`; `or` liga com `or`):
 
 ```sea
 q:where("nome", "Ana")                         -- igualdade
@@ -96,7 +110,7 @@ q:where("saldo", "between", 400, 1500)         -- between leva dois valores
 q:where("email", nil)                          -- is null (where("email", "!=", nil): is not null)
 q:where({ativo = true, uf = ["SP", "RJ"]})     -- tabela de igualdades; um array vira in
 q:where("uf in ? and saldo > ?", ufs, 100)     -- expressão
-q:where(function(g) g:where("a", 1):or_where("b", 2) end)   -- grupo entre parênteses
+q:where(function(g) g:where("a", 1):or("b", 2) end)  -- grupo entre parênteses
 q:where(rdd.raw("lower(nome) = ?", "ana"))     -- SQL cru (veja "SQL cru")
 ```
 
@@ -111,9 +125,9 @@ q:order_by(["-saldo", "nome"])        -- um array
 q:order_by("nome", "desc")            -- um campo e a direção
 ```
 
-Na expressão: `campo op valor` com `=`, `==`, `!=`, `<>`, `<`, `<=`, `>`, `>=`, `like`, `ilike`, `contains`, `starts_with`, `ends_with`; `campo [not] in ('a', 'b')` ou `campo [not] in ?` (um array); `campo between 1 and 9`; `campo is [not] null`. Valores: `?`, `'texto'` (`''` para uma aspa), números, `true`, `false`. `and` liga mais forte que `or`, parênteses agrupam, palavras-chave em qualquer caixa. A expressão pode ser combinada com as outras chamadas (`where`, `or_where`, grupos com função). Um campo com ponto é um caminho em sub-documento (`endereco.uf`) ou, depois de um `join`, um campo da tabela juntada pelo seu apelido (`p.valor`, veja abaixo).
+Na expressão: `campo op valor` com `=`, `==`, `!=`, `<>`, `<`, `<=`, `>`, `>=`, `like`, `ilike`, `contains`, `starts_with`, `ends_with`; `campo [not] in ('a', 'b')` ou `campo [not] in ?` (um array); `campo between 1 and 9`; `campo is [not] null`. Valores: `?`, `'texto'` (`''` para uma aspa), números, `true`, `false`. `and` liga mais forte que `or`, parênteses agrupam, palavras-chave em qualquer caixa. A expressão pode ser combinada com as outras chamadas (`where`, `or`, grupos com função). Um campo com ponto é um caminho em sub-documento (`endereco.uf`) ou, depois de um `join`, um campo da tabela juntada pelo seu apelido (`p.valor`, veja abaixo).
 
-**Precedência:** numa cadeia que mistura `where` e `or_where`, vale a do SQL: `where(a):or_where(b):where(c)` é `a or (b and c)`. O plano entregue ao driver deixa isso explícito (cada trecho de `and` vira um grupo), então todo driver avalia igual, seja concatenando SQL ou avaliando da esquerda para a direita.
+**Precedência:** numa cadeia que mistura `where` e `or`, vale a do SQL: `where(a):or(b):where(c)` é `a or (b and c)`. O plano entregue ao driver deixa isso explícito (cada trecho de `and` vira um grupo), então todo driver avalia igual, seja concatenando SQL ou avaliando da esquerda para a direita.
 
 **nil:** `where("email", nil)` (ou `email = ?` com `nil`) entra no plano como `is_null`, e `where("email", "!=", nil)` como `is_not_null`.
 

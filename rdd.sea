@@ -165,14 +165,11 @@ function Model.where(self, ...)
     local q = self:query()
     return q.where(q, ...)
 end
-function Model.and_where(self, ...)
-    local q = self:query()
-    return q.and_where(q, ...)
-end
-function Model.or_where(self, ...)
-    local q = self:query()
-    return q.or_where(q, ...)
-end
+function Model.in(self, field, values) return self:query():in(field, values) end
+function Model.not_in(self, field, values) return self:query():not_in(field, values) end
+function Model.between(self, field, low, high) return self:query():between(field, low, high) end
+function Model.is_null(self, field) return self:query():is_null(field) end
+function Model.is_not_null(self, field) return self:query():is_not_null(field) end
 function Model.fields(self, ...)
     local q = self:query()
     return q.fields(q, ...)

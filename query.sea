@@ -37,7 +37,7 @@ local VALID_OPS = {
     ["<="] = true,
     [">"] = true,
     [">="] = true,
-    ["in"] = true,
+    in = true,
     not_in = true,
     is_null = true,
     is_not_null = true,
@@ -223,9 +223,9 @@ end
 -- tighter than or; parentheses group. Keywords in any case.
 
 local KEYWORDS = {
-    ["and"] = true, ["or"] = true, ["not"] = true, ["in"] = true, is = true, null = true,
+    and = true, or = true, not = true, in = true, is = true, null = true,
     between = true, like = true, ilike = true, contains = true, starts_with = true, ends_with = true,
-    ["true"] = true, ["false"] = true,
+    true = true, false = true,
 }
 
 -- the tokens of an expression: {kind = "name"|"kw"|"op"|"num"|"str"|"ph"|"(" |")"|",", text}
@@ -560,7 +560,7 @@ function Query.left_join(self, target, alias, on)
     return add_join(self, "left", target, alias, on)
 end
 
--- query.raw(sql, values...) → a SQL condition to pass to where()/or_where()
+-- query.raw(sql, values...) → a SQL condition to pass to where()/or()
 -- (also rdd.raw). It goes into the query as written, in parentheses, its ?
 -- taking the values as parameters (?? is a literal ?). The text is not
 -- checked against the schema; with joins, name columns as the SQL does
@@ -602,20 +602,43 @@ end
 --   where("saldo", "between", 400, 1500)
 --   where({ativo = true, uf = ["SP", "RJ"]})    equalities; an array is in
 --   where("uf in ? and saldo > ?", ufs, 100)    an expression
---   where(function(g) g:where(...):or_where(...) end)   a group
+--   where(function(g) g:where(...):or(...) end)   a group
 --   where(rdd.raw("lower(nome) = ?", "ana"))    raw SQL
 function Query.where(self, ...)
     return where_args(self, "and", [...])
 end
 
--- q:and_where(...) — alias for where(...)
-function Query.and_where(self, ...)
+-- q:and(...) — the same as where(...), for chains that read and/or
+function Query.and(self, ...)
     return where_args(self, "and", [...])
 end
 
--- q:or_where(...) — the same forms as where(), joined with or
-function Query.or_where(self, ...)
+-- q:or(...) — the same forms as where(), joined with or
+function Query.or(self, ...)
     return where_args(self, "or", [...])
+end
+
+-- Shortcuts for the operators that read best as words (all joined with and;
+-- inside or(function(g) ... end) they build an alternative):
+-- q:in(field, values), q:not_in(field, values)
+function Query.in(self, field, values)
+    return add_condition(self, "and", field, "in", values, 3)
+end
+function Query.not_in(self, field, values)
+    return add_condition(self, "and", field, "not_in", values, 3)
+end
+
+-- q:between(field, low, high)
+function Query.between(self, field, low, high)
+    return add_condition(self, "and", field, "between", [low, high], 3)
+end
+
+-- q:is_null(field), q:is_not_null(field)
+function Query.is_null(self, field)
+    return add_condition(self, "and", field, "is_null", nil, 3)
+end
+function Query.is_not_null(self, field)
+    return add_condition(self, "and", field, "is_not_null", nil, 3)
 end
 
 -- q:fields(f1, f2, ...) or q:fields(["f1", "f2"]) — projection
@@ -795,7 +818,7 @@ function Query.offset(self, n)
     return self
 end
 
--- A list where an "and" follows an "or" (where(a):or_where(b):where(c))
+-- A list where an "and" follows an "or" (where(a):or(b):where(c))
 -- reads one way with SQL precedence, a or (b and c), and another left to
 -- right, (a or b) and c. The plan takes the SQL reading and makes it
 -- explicit: each run of "and" conditions becomes a group, so every driver

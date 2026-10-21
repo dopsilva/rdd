@@ -112,22 +112,23 @@ local function main()
     printf("  SQL: %s\n  params: %s\n", st.sql, json.encode(st.params))
     for _, c in q:all()? do printf("  %s (%s, R$ %.2f)\n", c.nome, c.endereco.uf, c.saldo) end
 
-    section("Operadores: tudo por where(campo, operador, valor)")
+    section("Operadores")
     local function nomes(query)
         local out = []
         for _, r in query:order_by("nome"):all()? do out[] = r.nome end
         return string.join(out, ", ")
     end
-    local function show(label, query) printf("  %s %s\n", pad(label, 34), nomes(query)) end
-    show("uf in [PR, PE]", clientes:where("endereco.uf", "in", ["PR", "PE"]))
-    show("uf not in [SP, PR]", clientes:where("endereco.uf", "not in", ["SP", "PR"]))
-    show("saldo between 400 e 1500", clientes:where("saldo", "between", 400, 1500))
-    show("sem e-mail (nil)", clientes:where("email", nil))
-    show("nome starts with 'B'", clientes:where("nome", "starts with", "B"))
-    show("nome ilike 'e%'", clientes:where("nome", "ilike", "e%"))
-    show("tabela {ativo, uf = [SP, RJ]}", clientes:where({ativo = true, ["endereco.uf"] = ["SP", "RJ"]}))
+    local function show(label, query) printf("  %s %s\n", pad(label, 40), nomes(query)) end
+    show(":in(\"endereco.uf\", [PR, PE])", clientes:in("endereco.uf", ["PR", "PE"]))
+    show(":not_in(\"endereco.uf\", [SP, PR])", clientes:not_in("endereco.uf", ["SP", "PR"]))
+    show(":between(\"saldo\", 400, 1500)", clientes:between("saldo", 400, 1500))
+    show(":is_null(\"email\")", clientes:is_null("email"))
+    show(":where(\"nome\", \"starts with\", \"B\")", clientes:where("nome", "starts with", "B"))
+    show(":where(\"nome\", \"ilike\", \"e%\")", clientes:where("nome", "ilike", "e%"))
+    show(":where({ativo, uf = [SP, RJ]})", clientes:where({ativo = true, ["endereco.uf"] = ["SP", "RJ"]}))
+    show(":where(uf = SP):or(saldo < 500)", clientes:where("endereco.uf", "SP"):or("saldo", "<", 500))
     -- contains escapa o % do valor: só casa com o texto "50%"
-    show("produto contains '50%'", produtos:where("nome", "contains", "50%"))
+    show(":where(\"nome\", \"contains\", \"50%\")", produtos:where("nome", "contains", "50%"))
 
     section("Pedidos com cliente e produto (dois joins)")
     local itens = pedidos:join(Clientes, "c", "c.id = cliente_id")
