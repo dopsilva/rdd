@@ -16,6 +16,12 @@
 --       limit      = 10,
 --       offset     = 0,
 --   }
+--
+-- After aggregate() the plan also has
+--       group_by   = ["endereco.uf"],
+--       aggregates = [{name = "total", fn = "sum", field = "saldo"}],  -- field nil: count(*)
+-- and the query returns one row per group; limit, offset and orders (which
+-- may name an aggregate) then apply to the groups.
 
 local M = {}
 
@@ -435,6 +441,8 @@ function Query.clone(self)
     end
     c._limit = self._limit
     c._offset = self._offset
+    for _, f in self._group do c._group[] = f end
+    for _, a in self._aggs do c._aggs[] = a end
     return c
 end
 
@@ -532,12 +540,74 @@ function Query.order_by(self, field, dir)
         self._err = error(`rdd: order_by direction must be 'asc' or 'desc', got '${dir}'`)
         return self
     end
-    local ok = check_field(self.schema, field)
-    if is_error(ok) then
-        self._err = ok
-        return self
+    -- after aggregate(), an aggregate's name orders too
+    local is_agg = false
+    for _, a in self._aggs do
+        if a.name == field then is_agg = true end
+    end
+    if not is_agg then
+        local ok = check_field(self.schema, field)
+        if is_error(ok) then
+            self._err = ok
+            return self
+        end
     end
     self._orders[] = {field = field, dir = dir}
+    return self
+end
+
+-- q:group_by(f1, f2, ...) or q:group_by(["f1", "f2"]) — groups for aggregate()
+function Query.group_by(self, ...)
+    if self._err ~= nil then return self end
+    local args = [...]
+    if len(args) == 1 and type(args[0]) == "array" then args = args[0] end
+    for _, f in args do
+        local ok = check_field(self.schema, f)
+        if is_error(ok) then
+            self._err = ok
+            return self
+        end
+        self._group[] = f
+    end
+    return self
+end
+
+local AGG_FNS = {count = true, sum = true, avg = true, min = true, max = true}
+
+-- q:aggregate({name = "fn(field)", ...}) — the query returns one row per
+-- group (or a single row without group_by) holding the group_by fields and
+-- each named aggregate: count(*), count(field), sum, avg, min, max. As in
+-- SQL, nils are skipped, and sum/avg/min/max of no values are nil.
+function Query.aggregate(self, specs)
+    if self._err ~= nil then return self end
+    if not is_record(specs) then
+        self._err = error("rdd: aggregate() expects a table like {total = \"sum(saldo)\"}")
+        return self
+    end
+    for _, name in list.keys(specs) do
+        local spec = specs[name]
+        local m = type(spec) == "string" and re.captures("^\\s*([A-Za-z_]+)\\s*\\(\\s*([A-Za-z0-9_.]+|\\*)\\s*\\)\\s*$", spec) or nil
+        if m == nil or not AGG_FNS[string.lower(m[1])] then
+            self._err = error(`rdd: aggregate '${name}': expected count(*) or count/sum/avg/min/max(field), got '${tostring(spec)}'`)
+            return self
+        end
+        local fn = string.lower(m[1])
+        local field = m[2]
+        if field == "*" then
+            if fn ~= "count" then
+                self._err = error(`rdd: aggregate '${name}': only count takes *`)
+                return self
+            end
+            field = nil
+        else
+            local ok = check_field(self.schema, field)
+            if is_error(ok) then
+                self._err = ok
+                return self
+            end
+        end
+        self._aggs[] = {name = name, fn = fn, field = field}
+    end
     return self
 end
 
@@ -631,7 +701,110 @@ function Query.to_plan(self)
     plan.orders = orders
     plan.limit = self._limit
     plan.offset = self._offset
+    if len(self._aggs) > 0 then
+        local group = []
+        for _, f in self._group do group[] = f end
+        plan.group_by = group
+        local aggs = []
+        for _, a in self._aggs do aggs[] = {name = a.name, fn = a.fn, field = a.field} end
+        plan.aggregates = aggs
+    elseif len(self._group) > 0 then
+        return error("rdd: group_by() needs aggregate() to say what each group computes")
+    end
     return plan
+end
+
+local function get_path(doc, path)
+    local v = doc
+    for _, p in string.split(path, ".") do
+        if not is_record(v) then return nil end
+        v = v[p]
+    end
+    return v
+end
+
+local function compare(a, b)
+    if a == b then return 0 end
+    if a == nil then return -1 end
+    if b == nil then return 1 end
+    if type(a) == "bool" then a = a and 1 or 0 end
+    if type(b) == "bool" then b = b and 1 or 0 end
+    return a < b and -1 or 1
+end
+
+-- query.aggregate_rows(docs, plan) → rows
+-- Groups and aggregates documents in memory, then orders and pages the
+-- groups: what q:aggregate() does with a driver that has no aggregate().
+function M.aggregate_rows(docs, plan)
+    local groups = []
+    local by_key = [=]
+    for _, d in docs do
+        local vals = []
+        for _, f in plan.group_by do vals[] = get_path(d, f) end
+        local key = json.encode(vals)
+        local g = by_key[key]
+        if g == nil then
+            g = {}
+            g.vals = vals
+            g.docs = []
+            by_key[key] = g
+            groups[] = g
+        end
+        g.docs[] = d
+    end
+    if len(groups) == 0 and len(plan.group_by) == 0 then
+        local g = {}
+        g.vals = []
+        g.docs = []
+        groups[] = g
+    end
+    local rows = []
+    for _, g in groups do
+        local row = {}
+        for i, f in plan.group_by do row[f] = g.vals[i] end
+        for _, a in plan.aggregates do
+            local n = 0
+            local acc = nil
+            for _, d in g.docs do
+                local v = a.field == nil and true or get_path(d, a.field)
+                if v ~= nil then
+                    n += 1
+                    if a.fn == "sum" or a.fn == "avg" then
+                        acc = (acc or 0) + v
+                    elseif a.fn == "min" then
+                        if acc == nil or compare(v, acc) < 0 then acc = v end
+                    elseif a.fn == "max" then
+                        if acc == nil or compare(v, acc) > 0 then acc = v end
+                    end
+                end
+            end
+            if a.fn == "count" then
+                row[a.name] = n
+            elseif a.fn == "avg" then
+                row[a.name] = n > 0 and acc / n or nil
+            else
+                row[a.name] = acc
+            end
+        end
+        rows[] = row
+    end
+    if len(plan.orders) > 0 then
+        sort.sort(rows, function(x, y)
+            for _, o in plan.orders do
+                local c = compare(x[o.field], y[o.field])
+                if c ~= 0 then
+                    if o.dir == "desc" then return c > 0 end
+                    return c < 0
+                end
+            end
+            return false
+        end)
+    end
+    local from = plan.offset or 0
+    if from == 0 and plan.limit == nil then return rows end
+    local to = plan.limit ~= nil and math.min(from + plan.limit, len(rows)) or len(rows)
+    if from >= to then return [] end
+    return list.slice(rows, from, to)
 end
 
 -- q:ast() — alias for to_plan()
@@ -649,11 +822,21 @@ local function require_conn(self)
     return self.conn
 end
 
--- q:all() → array of docs | error
+-- q:all() → array of docs | error (aggregate rows after aggregate())
 function Query.all(self)
     local conn = require_conn(self)?
     local plan = self:to_plan()?
-    return conn:find(self.schema, plan)
+    if plan.aggregates == nil then return conn:find(self.schema, plan) end
+    if type(conn.aggregate) == "function" then return conn:aggregate(self.schema, plan) end
+    local base = self:clone()
+    base._aggs = []
+    base._group = []
+    base._orders = []
+    base._fields = []
+    base._limit = nil
+    base._offset = nil
+    local docs = conn:find(self.schema, base:to_plan()?)?
+    return M.aggregate_rows(docs, plan)
 end
 
 -- q:first() → doc | nil | error
@@ -675,10 +858,11 @@ function Query.one(self)
     return rows[0]
 end
 
--- q:count() → int | error
+-- q:count() → int | error (the number of groups after aggregate())
 function Query.count(self)
     local conn = require_conn(self)?
     local plan = self:to_plan()?
+    if plan.aggregates ~= nil then return len(self:all()?) end
     if type(conn.count) == "function" then
         return conn:count(self.schema, plan)
     end
@@ -691,6 +875,45 @@ function Query.exists(self)
     local c = self:clone():limit(1)
     local n = c:count()?
     return n > 0
+end
+
+-- One aggregate over every matching document (group_by, orders and paging
+-- left out).
+local function scalar(self, fn, field)
+    local c = self:clone()
+    c._group = []
+    c._aggs = []
+    c._orders = []
+    c._limit = nil
+    c._offset = nil
+    local rows = c:aggregate({value = `${fn}(${field})`}):all()?
+    return rows[0].value
+end
+
+-- q:sum(field), q:avg(field), q:min(field), q:max(field) → value | nil | error
+function Query.sum(self, field) return scalar(self, "sum", field) end
+function Query.avg(self, field) return scalar(self, "avg", field) end
+function Query.min(self, field) return scalar(self, "min", field) end
+function Query.max(self, field) return scalar(self, "max", field) end
+
+-- q:paginate(page, per_page) → {items, total, page, per_page, pages} | error
+-- page counts from 1; total is the number of matching documents.
+function Query.paginate(self, page, per_page)
+    if type(page) ~= "int" or page < 1 or type(per_page) ~= "int" or per_page < 1 then
+        return error(`rdd: paginate(page, per_page) expects ints >= 1, got ${tostring(page)}, ${tostring(per_page)}`)
+    end
+    local all = self:clone()
+    all._limit = nil
+    all._offset = nil
+    local total = all:count()?
+    local items = all:clone():limit(per_page):offset((page - 1) * per_page):all()?
+    local out = {}
+    out.items = items
+    out.total = total
+    out.page = page
+    out.per_page = per_page
+    out.pages = (total + per_page - 1) // per_page
+    return out
 end
 
 -- q:each(fn) → int (rows visited) | error
@@ -732,6 +955,8 @@ function M.new(schema, conn)
     q._orders = []
     q._limit = nil
     q._offset = nil
+    q._group = []
+    q._aggs = []
     return with_methods(q, Query)
 end
 

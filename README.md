@@ -5,7 +5,7 @@ O **RDD** é uma camada de abstração de dados e ORM/ODM para a linguagem **Sea
 O RDD cuida de:
 1. **Registro e validação de contrato de drivers** (`rdd.register_driver`).
 2. **Definição e validação de Schemas** (`rdd.schema`), suportando tanto modelos tabulares quanto documentos encadeados (`document`, `array` de sub-documentos, `map`, etc.), valores padrão (`default_val`), campos gerados (`auto`) e validação de tipos.
-3. **Query Builder Fluente** (`where`, `or_where`, `where_in`, `where_between`, `fields`, `order_by`, `limit`, `offset`), gerando um **Query Plan (AST)** abstrato que é repassado junto com o `Schema` e o documento bruto para o driver registrado.
+3. **Query Builder Fluente** (`where`, `or_where`, `where_in`, `where_between`, `fields`, `order_by`, `limit`, `offset`, `group_by`/`aggregate`, `paginate`), gerando um **Query Plan (AST)** abstrato que é repassado junto com o `Schema` e o documento bruto para o driver registrado.
 
 ---
 
@@ -101,7 +101,40 @@ local afetados = clientes:where("id", novo.id):update({
 
 -- Remoção
 local removidos = clientes:where("ativo", false):delete()?
+
+-- Inserir ou atualizar pela chave primária (num comando só se o driver tem upsert)
+local salvo = clientes:save({id = 7, nome = "Maria", email = "maria@example.com"})?
 ```
+
+### Agregações e paginação
+
+```sea
+-- Uma linha por grupo, com os campos do group_by e cada agregado nomeado
+local por_uf = clientes:where("ativo", true)
+    :group_by("endereco.uf")
+    :aggregate({n = "count(*)", total = "sum(saldo)", media = "avg(saldo)"})
+    :order_by("-total")      -- order_by pode usar o nome de um agregado
+    :limit(5)
+    :all()?
+-- por_uf[0] → {["endereco.uf"] = "SP", n = 3, total = 90.0, media = 30.0}
+
+local total = clientes:sum("saldo")?                  -- também avg, min e max
+local maior = clientes:where("endereco.uf", "SP"):max("saldo")?
+
+local pagina = clientes:order_by("nome"):paginate(2, 20)?
+-- {items = [...], total = 57, page = 2, per_page = 20, pages = 3}
+```
+
+As funções de agregação são:
+- `count(*)`;
+- `count(campo)`;
+- `sum`, `avg`, `min` e `max` de um campo.
+
+Elas seguem a regra do SQL: valores nil são ignorados, e `sum`/`avg`/`min`/`max` sem nenhum valor dão `nil`. Com agregados, `limit`, `offset` e `order_by` valem para os grupos, e `count()` conta os grupos.
+
+Um driver com `conn:aggregate(schema, plan)` calcula tudo no banco; o `rdd.sql` implementa esse método com `GROUP BY`. Sem ele, o RDD busca os documentos com `find` e agrupa em memória.
+
+`paginate(página, por_página)` começa a contar as páginas em 1. O campo `total` traz o número de documentos que satisfazem a query, sem a paginação.
 
 ---
 
@@ -186,6 +219,7 @@ O handle da biblioteca `sqlite` do Sea já serve como está. Para um banco cuja 
 | Função | Resultado |
 | --- | --- |
 | `sql.find(schema, plan, d)` | `{sql, params}` do `SELECT` |
+| `sql.aggregate(schema, plan, d)` | `{sql, params}` do `SELECT ... GROUP BY` de um plano com agregados |
 | `sql.count(schema, plan, d)` | `{sql, params}` do `SELECT COUNT(*)`, respeitando `limit`/`offset` |
 | `sql.insert(schema, doc, d)` | `{sql, params}` do `INSERT` (com `RETURNING` no postgres) |
 | `sql.upsert(schema, doc, d)` | `{sql, params}` que insere ou atualiza pela chave primária (`ON CONFLICT` no SQLite/postgres, `MERGE` no SQL Server) |

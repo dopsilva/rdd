@@ -229,6 +229,21 @@ local function main()
     local carlos = clientes:where("nome", "Carlos"):first()?
     printf("\nApós update -> %s agora mora em %s/%s com saldo R$ %.2f\n",
         carlos.nome, carlos.endereco.cidade, carlos.endereco.uf, carlos.saldo)
+
+    -- Agregações: este driver não tem aggregate(), então o RDD agrupa em memória
+    print("\n=== Saldo por UF ===")
+    local por_uf = clientes:group_by("endereco.uf")
+        :aggregate({n = "count(*)", total = "sum(saldo)"})
+        :order_by("-total")
+        :all()?
+    for _, r in por_uf do
+        printf("  %s: %d cliente(s), R$ %.2f\n", r["endereco.uf"], r.n, r.total)
+    end
+    printf("Saldo total: R$ %.2f\n", clientes:sum("saldo")?)
+
+    local pagina = clientes:order_by("nome"):paginate(1, 2)?
+    printf("Página %d de %d (%d clientes): %s, %s\n", pagina.page, pagina.pages, pagina.total,
+        pagina.items[0].nome, pagina.items[1].nome)
 end
 
 local err = main()

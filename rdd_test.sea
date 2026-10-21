@@ -383,6 +383,64 @@ t.describe("rdd end-to-end with registered SQLite driver", function()
         t.is_nil(proj.saldo)
     end)
 
+    t.it("aggregates and paginates, in SQL and in the in-memory fallback", function()
+        local _ = t.no_error(model:insert_many([
+            {nome = "Ana", email = "a@x.com", saldo = 10.0, endereco = {rua = "R", cidade = "Santos", uf = "SP"}},
+            {nome = "Bia", email = "b@x.com", saldo = 20.0, ativo = false, endereco = {rua = "R", cidade = "Rio", uf = "RJ"}},
+            {nome = "Caio", saldo = 30.0, endereco = {rua = "R", cidade = "Campinas", uf = "SP"}},
+            {nome = "Duda", email = "d@x.com", saldo = 40.0, endereco = {rua = "R", cidade = "Recife", uf = "PE"}},
+            {nome = "Eva", email = "e@x.com", saldo = 50.0, endereco = {rua = "R", cidade = "Osasco", uf = "SP"}},
+        ]))
+        local function check()
+            local rows = t.no_error(model:group_by("endereco.uf")
+                :aggregate({n = "count(*)", total = "sum(saldo)", emails = "count(email)", maior = "max(saldo)"})
+                :order_by("-total"):all())
+            t.eq(len(rows), 3)
+            t.eq(rows[0]["endereco.uf"], "SP")
+            t.eq(rows[0].n, 3)
+            t.eq(rows[0].total, 90.0)
+            t.eq(rows[0].emails, 2)
+            t.eq(rows[0].maior, 50.0)
+            t.eq(rows[2]["endereco.uf"], "RJ")
+
+            rows = t.no_error(model:where("saldo", ">", 15):group_by("ativo")
+                :aggregate({media = "avg(saldo)"}):order_by("ativo"):all())
+            t.eq(len(rows), 2)
+            t.eq(rows[0].ativo, false)
+            t.eq(rows[0].media, 20.0)
+            t.eq(rows[1].media, 40.0)
+
+            rows = t.no_error(model:group_by("endereco.uf"):aggregate({n = "count(*)"})
+                :order_by("endereco.uf"):limit(1):offset(1):all())
+            t.eq(len(rows), 1)
+            t.eq(rows[0]["endereco.uf"], "RJ")
+            t.eq(t.no_error(model:group_by("endereco.uf"):aggregate({n = "count(*)"}):count()), 3)
+
+            t.eq(t.no_error(model:sum("saldo")), 150.0)
+            t.eq(t.no_error(model:where("endereco.uf", "SP"):avg("saldo")), 30.0)
+            t.eq(t.no_error(model:min("nome")), "Ana")
+            t.eq(t.no_error(model:max("saldo")), 50.0)
+            t.is_nil(t.no_error(model:where("saldo", ">", 100):sum("saldo")))
+
+            local pg = t.no_error(model:order_by("nome"):paginate(2, 2))
+            t.eq(pg.total, 5)
+            t.eq(pg.pages, 3)
+            t.eq(len(pg.items), 2)
+            t.eq(pg.items[0].nome, "Caio")
+            t.eq(len(t.no_error(model:order_by("nome"):paginate(3, 2)).items), 1)
+        end
+        t.eq(type(model.conn.aggregate), "function")
+        check()
+        model.conn.aggregate = nil
+        check()
+
+        t.is_error(model:aggregate({x = "median(saldo)"}):all(), "expected count(*)")
+        t.is_error(model:aggregate({x = "sum(*)"}):all(), "only count takes *")
+        t.is_error(model:aggregate({x = "sum(peso)"}):all(), "unknown field")
+        t.is_error(model:group_by("nome"):all(), "needs aggregate()")
+        t.is_error(model:paginate(0, 10), "paginate")
+    end)
+
     t.it("saves with upsert and with the lookup fallback", function()
         local function check_save()
             local a = t.no_error(model:save({nome = "Ana", email = "a@x.com", saldo = 1.0}))

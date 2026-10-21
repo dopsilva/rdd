@@ -340,6 +340,37 @@ function M.find(schema, plan, d)
     return {sql = s, params = p.values}
 end
 
+-- sql.aggregate(schema, plan, d) → {sql, params} | error
+-- For a plan with aggregates: one row per group_by combination, columns named
+-- after the group fields and the aggregates; orders may name an aggregate.
+function M.aggregate(schema, plan, d)
+    local p = new_params(d)
+    local cols = []
+    local groups = []
+    for _, f in plan.group_by do
+        local e = M.column(schema, f, d)
+        groups[] = e
+        cols[] = `${e} AS ${d.quote(f)}`
+    end
+    local names = [=]
+    for _, a in plan.aggregates do
+        local arg = a.field == nil and "*" or M.column(schema, a.field, d)
+        cols[] = `${string.upper(a.fn)}(${arg}) AS ${d.quote(a.name)}`
+        names[a.name] = true
+    end
+    local s = `SELECT ${string.join(cols, ", ")} FROM ${table_name(plan, schema, d)}`
+    s ..= where_clause(schema, plan, p)?
+    if len(groups) > 0 then s ..= ` GROUP BY ${string.join(groups, ", ")}` end
+    local ord = []
+    for _, o in plan.orders or [] do
+        local e = names[o.field] and d.quote(o.field) or M.column(schema, o.field, d)
+        ord[] = `${e} ${string.upper(o.dir or "asc")}`
+    end
+    if len(ord) > 0 then s ..= ` ORDER BY ${string.join(ord, ", ")}` end
+    s = d.paging(s, plan.limit, plan.offset, len(ord) > 0)
+    return {sql = s, params = p.values}
+end
+
 -- sql.count(schema, plan, d) → {sql, params} | error (limit/offset respected)
 function M.count(schema, plan, d)
     local p = new_params(d)
@@ -513,6 +544,25 @@ end
 function Conn.count(self, schema, plan)
     local st = M.count(schema, plan, self.dialect)?
     return self.db:value(st.sql, st.params)
+end
+
+function Conn.aggregate(self, schema, plan)
+    local d = self.dialect
+    local st = M.aggregate(schema, plan, d)?
+    local rows = self.db:query(st.sql, st.params)?
+    local out = []
+    for _, r in rows do
+        local row = {}
+        for _, f in plan.group_by do row[f] = d.read(r[f], schema:field_at(f)) end
+        for _, a in plan.aggregates do
+            local v = r[a.name]
+            -- min/max of a bool or JSON field come back in the column's encoding
+            if (a.fn == "min" or a.fn == "max") and a.field ~= nil then v = d.read(v, schema:field_at(a.field)) end
+            row[a.name] = v
+        end
+        out[] = row
+    end
+    return out
 end
 
 function Conn.update(self, schema, plan, changes)
