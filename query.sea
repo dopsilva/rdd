@@ -1,0 +1,417 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- query — fluent query builder and abstract query plan (AST) for RDD
+--
+-- Builds a driver-independent query plan:
+--   {
+--       collection = "clientes",
+--       schema     = <Schema>,
+--       fields     = ["id", "nome"],
+--       filters    = [
+--           {kind = "cond", logic = "and", field = "ativo", op = "=", value = true},
+--           {kind = "group", logic = "or", filters = [...]},
+--       ],
+--       orders     = [{field = "nome", dir = "asc"}],
+--       limit      = 10,
+--       offset     = 0,
+--   }
+
+local M = {}
+
+local VALID_OPS = {
+    ["="] = true,
+    ["!="] = true,
+    ["<"] = true,
+    ["<="] = true,
+    [">"] = true,
+    [">="] = true,
+    ["in"] = true,
+    not_in = true,
+    is_null = true,
+    is_not_null = true,
+    between = true,
+    like = true,
+    ilike = true,
+    contains = true,
+    starts_with = true,
+    ends_with = true,
+}
+
+local Query = {}
+
+local function is_record(v)
+    local t = type(v)
+    return t == "table" or t == "struct" or t == "map"
+end
+
+local function with_methods(obj, methods)
+    for k, f in methods do obj[k] = f end
+    return obj
+end
+
+local function check_field(schema, field_path)
+    if type(field_path) ~= "string" or string.trim(field_path) == "" then
+        return error("rdd: query field name must be a non-empty string")
+    end
+    if schema ~= nil and not schema.allow_extra then
+        if schema:field_at(field_path) == nil then
+            return error(`rdd: unknown field '${schema.name}.${field_path}' in query`)
+        end
+    end
+    return true
+end
+
+local function clone_filters(filters)
+    local out = []
+    for _, f in filters do
+        local c = {}
+        c.kind = f.kind
+        c.logic = f.logic
+        if f.kind == "group" then
+            c.filters = clone_filters(f.filters)
+        else
+            c.field = f.field
+            c.op = f.op
+            c.value = f.value
+        end
+        out[] = c
+    end
+    return out
+end
+
+local function add_condition(q, logic, a, b, c, nargs)
+    if q._err ~= nil then return q end
+
+    -- Grouped sub-query: q:where(function(sub) ... end)
+    if nargs == 1 and type(a) == "function" then
+        local sub = M.new(q.schema, q.conn)
+        local r = a(sub)
+        if is_error(r) then
+            q._err = r
+            return q
+        end
+        if sub._err ~= nil then
+            q._err = sub._err
+            return q
+        end
+        if len(sub._filters) > 0 then
+            local g = {}
+            g.kind = "group"
+            g.logic = logic
+            g.filters = clone_filters(sub._filters)
+            q._filters[] = g
+        end
+        return q
+    end
+
+    -- Equality map/table shorthand: q:where({ativo = true, uf = "SP"})
+    if nargs == 1 and is_record(a) then
+        local keys = list.keys(a)
+        for i, k in keys do
+            local item_logic = (i == 0) and logic or "and"
+            add_condition(q, item_logic, k, "=", a[k], 3)
+            if q._err ~= nil then return q end
+        end
+        return q
+    end
+
+    local field = a
+    local op = "="
+    local val = b
+    if nargs >= 3 then
+        op = b
+        val = c
+    elseif nargs < 2 then
+        q._err = error("rdd: where() requires (table), (fn), (field, value), or (field, op, value)")
+        return q
+    end
+
+    if op == "~=" then op = "!=" end
+    if type(op) ~= "string" or not VALID_OPS[op] then
+        q._err = error(`rdd: invalid query operator '${tostring(op)}'`)
+        return q
+    end
+
+    local ok = check_field(q.schema, field)
+    if is_error(ok) then
+        q._err = ok
+        return q
+    end
+
+    if (op == "in" or op == "not_in") and type(val) ~= "array" then
+        q._err = error(`rdd: operator '${op}' on '${field}' requires an array value`)
+        return q
+    end
+    if op == "between" and (type(val) ~= "array" or len(val) ~= 2) then
+        q._err = error(`rdd: operator 'between' on '${field}' requires a 2-element array [low, high]`)
+        return q
+    end
+
+    local node = {}
+    node.kind = "cond"
+    node.logic = logic
+    node.field = field
+    node.op = op
+    node.value = val
+    q._filters[] = node
+    return q
+end
+
+-- ---- Query builder methods ----
+
+-- q:clone() → independent copy of the query
+function Query.clone(self)
+    local c = M.new(self.schema, self.conn)
+    c._err = self._err
+    for _, f in self._fields do c._fields[] = f end
+    c._filters = clone_filters(self._filters)
+    for _, o in self._orders do
+        c._orders[] = {field = o.field, dir = o.dir}
+    end
+    c._limit = self._limit
+    c._offset = self._offset
+    return c
+end
+
+-- q:where(field, [op,] value) | q:where({k = v}) | q:where(function(sub) ... end)
+function Query.where(self, ...)
+    local args = {...}
+    return add_condition(self, "and", args[0], args[1], args[2], len(args))
+end
+
+-- q:and_where(...) — alias for where(...)
+function Query.and_where(self, ...)
+    local args = {...}
+    return add_condition(self, "and", args[0], args[1], args[2], len(args))
+end
+
+-- q:or_where(field, [op,] value) | q:or_where({k = v}) | q:or_where(function(sub) ... end)
+function Query.or_where(self, ...)
+    local args = {...}
+    return add_condition(self, "or", args[0], args[1], args[2], len(args))
+end
+
+-- q:where_in(field, list)
+function Query.where_in(self, field, values)
+    return add_condition(self, "and", field, "in", values, 3)
+end
+
+-- q:where_not_in(field, list)
+function Query.where_not_in(self, field, values)
+    return add_condition(self, "and", field, "not_in", values, 3)
+end
+
+-- q:where_null(field)
+function Query.where_null(self, field)
+    return add_condition(self, "and", field, "is_null", nil, 3)
+end
+
+-- q:where_not_null(field)
+function Query.where_not_null(self, field)
+    return add_condition(self, "and", field, "is_not_null", nil, 3)
+end
+
+-- q:where_between(field, low, high)
+function Query.where_between(self, field, low, high)
+    return add_condition(self, "and", field, "between", [low, high], 3)
+end
+
+-- q:fields(f1, f2, ...) or q:fields(["f1", "f2"]) — projection
+function Query.fields(self, ...)
+    if self._err ~= nil then return self end
+    local args = {...}
+    if len(args) == 1 and type(args[0]) == "array" then
+        args = args[0]
+    end
+    for _, f in args do
+        local ok = check_field(self.schema, f)
+        if is_error(ok) then
+            self._err = ok
+            return self
+        end
+        self._fields[] = f
+    end
+    return self
+end
+
+-- q:project(...) — alias for fields(...)
+function Query.project(self, ...)
+    return self.fields(self, ...)
+end
+
+-- q:order_by(field [, "asc"|"desc"]) — also accepts "-field" for desc
+function Query.order_by(self, field, dir)
+    if self._err ~= nil then return self end
+    if type(field) ~= "string" or string.trim(field) == "" then
+        self._err = error("rdd: order_by field must be a non-empty string")
+        return self
+    end
+    if dir == nil then
+        if string.starts_with(field, "-") then
+            field = string.sub(field, 2)
+            dir = "desc"
+        elseif string.starts_with(field, "+") then
+            field = string.sub(field, 2)
+            dir = "asc"
+        else
+            dir = "asc"
+        end
+    else
+        dir = string.lower(tostring(dir))
+    end
+    if dir ~= "asc" and dir ~= "desc" then
+        self._err = error(`rdd: order_by direction must be 'asc' or 'desc', got '${dir}'`)
+        return self
+    end
+    local ok = check_field(self.schema, field)
+    if is_error(ok) then
+        self._err = ok
+        return self
+    end
+    self._orders[] = {field = field, dir = dir}
+    return self
+end
+
+-- q:limit(n)
+function Query.limit(self, n)
+    if self._err ~= nil then return self end
+    if type(n) ~= "int" or n < 0 then
+        self._err = error(`rdd: limit must be a non-negative int, got ${tostring(n)}`)
+        return self
+    end
+    self._limit = n
+    return self
+end
+
+-- q:offset(n)
+function Query.offset(self, n)
+    if self._err ~= nil then return self end
+    if type(n) ~= "int" or n < 0 then
+        self._err = error(`rdd: offset must be a non-negative int, got ${tostring(n)}`)
+        return self
+    end
+    self._offset = n
+    return self
+end
+
+-- q:to_plan() → abstract query plan table | error
+function Query.to_plan(self)
+    if self._err ~= nil then return self._err end
+    local plan = {}
+    plan.collection = self.schema and self.schema.name or nil
+    plan.schema = self.schema
+    local fields = []
+    for _, f in self._fields do fields[] = f end
+    plan.fields = fields
+    plan.filters = clone_filters(self._filters)
+    local orders = []
+    for _, o in self._orders do orders[] = {field = o.field, dir = o.dir} end
+    plan.orders = orders
+    plan.limit = self._limit
+    plan.offset = self._offset
+    return plan
+end
+
+-- q:ast() — alias for to_plan()
+function Query.ast(self)
+    return self:to_plan()
+end
+
+-- ---- Terminal execution methods (require a bound driver connection) ----
+
+local function require_conn(self)
+    if self._err ~= nil then return self._err end
+    if self.conn == nil then
+        return error("rdd: query is not bound to a database session")
+    end
+    return self.conn
+end
+
+-- q:all() → array of docs | error
+function Query.all(self)
+    local conn = require_conn(self)?
+    local plan = self:to_plan()?
+    return conn:find(self.schema, plan)
+end
+
+-- q:first() → doc | nil | error
+function Query.first(self)
+    local c = self:clone():limit(1)
+    local rows = c:all()?
+    if len(rows) == 0 then return nil end
+    return rows[0]
+end
+
+-- q:one() → doc | nil | error (returns error if more than 1 document matches)
+function Query.one(self)
+    local c = self:clone():limit(2)
+    local rows = c:all()?
+    if len(rows) == 0 then return nil end
+    if len(rows) > 1 then
+        return error(`rdd: expected at most one document from '${self.schema.name}', got multiple`)
+    end
+    return rows[0]
+end
+
+-- q:count() → int | error
+function Query.count(self)
+    local conn = require_conn(self)?
+    local plan = self:to_plan()?
+    if type(conn.count) == "function" then
+        return conn:count(self.schema, plan)
+    end
+    local rows = conn:find(self.schema, plan)?
+    return len(rows)
+end
+
+-- q:exists() → bool | error
+function Query.exists(self)
+    local c = self:clone():limit(1)
+    local n = c:count()?
+    return n > 0
+end
+
+-- q:each(fn) → int (rows visited) | error
+function Query.each(self, fn)
+    local rows = self:all()?
+    local seen = 0
+    for _, row in rows do
+        seen += 1
+        local r = fn(row)
+        if is_error(r) then return r end
+        if r == false then break end
+    end
+    return seen
+end
+
+-- q:update(changes) → updated_count (int) | error
+function Query.update(self, changes)
+    local conn = require_conn(self)?
+    local plan = self:to_plan()?
+    local valid_changes = self.schema:validate_changes(changes)?
+    return conn:update(self.schema, plan, valid_changes)
+end
+
+-- q:delete() → deleted_count (int) | error
+function Query.delete(self)
+    local conn = require_conn(self)?
+    local plan = self:to_plan()?
+    return conn:delete(self.schema, plan)
+end
+
+-- query.new(schema [, conn]) → Query
+function M.new(schema, conn)
+    local q = {}
+    q.schema = schema
+    q.conn = conn
+    q._err = nil
+    q._fields = []
+    q._filters = []
+    q._orders = []
+    q._limit = nil
+    q._offset = nil
+    return with_methods(q, Query)
+end
+
+return M

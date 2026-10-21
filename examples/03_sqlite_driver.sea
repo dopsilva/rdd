@@ -1,0 +1,242 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- 03_sqlite_driver.sea — O mesmo modelo e queries rodando sobre SQLite
+--
+-- Demonstra como a aplicação mantém exatamente a mesma definição de Schema
+-- (incluindo documentos aninhados e arrays) e a mesma API de queries fluentes,
+-- trocando apenas o driver registrado para SQLite.
+--
+-- Execução:
+--   ~/projects/sea_vm/bin/sea examples/03_sqlite_driver.sea
+
+local sqlite = require("../../sea_vm/libs/sqlite/sqlite")
+local rdd = require("../rdd")
+
+-- ---- Implementação enxuta de um driver SQLite para o RDD ----
+
+local function sql_col(schema, field_path)
+    local parts = string.split(field_path, ".")
+    local root = parts[0]
+    if len(parts) == 1 then return root end
+    local f = schema:field(root)
+    if f ~= nil and (f.type == "document" or f.type == "map") then
+        local json_path = "$." .. string.join(list.slice(parts, 1), ".")
+        return `json_extract(${root}, '${json_path}')`
+    end
+    return field_path
+end
+
+local function bind_val(v)
+    if type(v) == "bool" then return v and 1 or 0 end
+    if type(v) == "table" or type(v) == "struct" or type(v) == "map" or type(v) == "array" then
+        return json.encode(v)
+    end
+    return v
+end
+
+local compile_filters
+
+compile_filters = function(schema, filters, params)
+    if len(filters) == 0 then return "" end
+    local out = []
+    for i, node in filters do
+        local prefix = (i == 0) and "" or ((node.logic == "or") and " OR " or " AND ")
+        if node.kind == "group" then
+            local inner = compile_filters(schema, node.filters, params)
+            if inner ~= "" then out[] = `${prefix}(${inner})` end
+        else
+            local col = sql_col(schema, node.field)
+            out[] = `${prefix}${col} ${node.op} ?`
+            params[] = bind_val(node.value)
+        end
+    end
+    return string.join(out, "")
+end
+
+rdd.register_driver("sqlite", {
+    open = function(opts)
+        local db = sqlite.open(opts.path or ":memory:")?
+        local conn = {}
+        conn.db = db
+
+        function conn.migrate(self, schema)
+            local cols = []
+            for _, fname in schema.field_order do
+                local f = schema.fields[fname]
+                local t = (f.type == "int" or f.type == "bool") and "INTEGER" or (f.type == "number" and "REAL" or "TEXT")
+                local def = `${fname} ${t}`
+                if f.primary_key then def ..= " PRIMARY KEY" end
+                cols[] = def
+            end
+            local _ = self.db:exec(`CREATE TABLE IF NOT EXISTS ${schema.name} (${string.join(cols, ", ")})`)?
+            return true
+        end
+
+        function conn.insert(self, schema, doc)
+            local cols = []
+            local ph = []
+            local params = []
+            for _, fname in schema.field_order do
+                if doc[fname] ~= nil then
+                    cols[] = fname
+                    ph[] = "?"
+                    params[] = bind_val(doc[fname])
+                end
+            end
+            local sql = `INSERT INTO ${schema.name} (${string.join(cols, ", ")}) VALUES (${string.join(ph, ", ")})`
+            local _ = self.db:exec(sql, params)?
+            local out = {}
+            for k, v in doc do out[k] = v end
+            if schema.primary_key ~= nil and out[schema.primary_key] == nil then
+                out[schema.primary_key] = self.db:last_insert_id()
+            end
+            return out
+        end
+
+        function conn.find(self, schema, plan)
+            local params = []
+            local sql = `SELECT * FROM ${plan.collection}`
+            local w = compile_filters(schema, plan.filters, params)
+            if w ~= "" then sql ..= ` WHERE ${w}` end
+            if len(plan.orders) > 0 then
+                local ord = []
+                for _, o in plan.orders do
+                    ord[] = `${sql_col(schema, o.field)} ${string.upper(o.dir)}`
+                end
+                sql ..= ` ORDER BY ${string.join(ord, ", ")}`
+            end
+            if plan.limit ~= nil then sql ..= ` LIMIT ${plan.limit}` end
+            local rows = self.db:query(sql, params)?
+            local result = []
+            for _, r in rows do
+                local d = {}
+                for _, fname in schema.field_order do
+                    local f = schema.fields[fname]
+                    local raw = r[fname]
+                    if raw ~= nil and f.type == "bool" then
+                        d[fname] = (raw == 1)
+                    elseif raw ~= nil and (f.type == "document" or f.type == "array" or f.type == "map") then
+                        d[fname] = json.decode(raw)
+                    else
+                        d[fname] = raw
+                    end
+                end
+                result[] = d
+            end
+            return result
+        end
+
+        function conn.update(self, schema, plan, changes)
+            local sets = []
+            local params = []
+            for _, k in list.keys(changes) do
+                if string.contains(k, ".") then
+                    local parts = string.split(k, ".")
+                    local root = parts[0]
+                    local jp = "$." .. string.join(list.slice(parts, 1), ".")
+                    sets[] = `${root} = json_set(COALESCE(${root}, '{}'), '${jp}', ?)`
+                else
+                    sets[] = `${k} = ?`
+                end
+                params[] = bind_val(changes[k])
+            end
+            local sql = `UPDATE ${plan.collection} SET ${string.join(sets, ", ")}`
+            local w = compile_filters(schema, plan.filters, params)
+            if w ~= "" then sql ..= ` WHERE ${w}` end
+            return self.db:exec(sql, params)
+        end
+
+        function conn.delete(self, schema, plan)
+            local params = []
+            local sql = `DELETE FROM ${plan.collection}`
+            local w = compile_filters(schema, plan.filters, params)
+            if w ~= "" then sql ..= ` WHERE ${w}` end
+            return self.db:exec(sql, params)
+        end
+
+        function conn.transaction(self, fn)
+            return self.db:transaction(function(_) return fn(self) end)
+        end
+
+        function conn.close(self)
+            return self.db:close()
+        end
+
+        return conn
+    end,
+})
+
+-- ---- Código da aplicação (idêntico ao exemplo 02!) ----
+
+local Clientes = rdd.schema("clientes", {
+    id = {type = "int", primary_key = true, auto = true},
+    nome = {type = "string", required = true},
+    ativo = {type = "bool", default_val = true},
+    saldo = {type = "number", default_val = 0.0},
+    endereco = {
+        cidade = {type = "string", required = true},
+        uf = {type = "string", default_val = "SP"},
+    },
+    pedidos = {
+        type = "array",
+        items = {
+            produto = "string",
+            valor = "number",
+        },
+    },
+})
+
+local function main()
+    local db = rdd.open("sqlite", {path = ":memory:"})?
+    defer db:close()
+
+    local _ = db:migrate(Clientes)?
+    local clientes = db:model(Clientes)
+
+    local _ = clientes:insert_many([
+        {
+            nome = "Ana",
+            saldo = 1200.0,
+            endereco = {cidade = "São Paulo", uf = "SP"},
+            pedidos = [{produto = "Teclado Mecânico", valor = 450.0}],
+        },
+        {
+            nome = "Carlos",
+            saldo = 450.0,
+            endereco = {cidade = "Curitiba", uf = "PR"},
+            pedidos = [],
+        },
+        {
+            nome = "Beatriz",
+            saldo = 3100.0,
+            endereco = {cidade = "Campinas", uf = "SP"},
+            pedidos = [
+                {produto = "Monitor 4K", valor = 2200.0},
+                {produto = "Mouse", valor = 300.0},
+            ],
+        },
+    ])?
+
+    print("=== [SQLite] Clientes de SP ordenados por maior saldo ===")
+    local paulistas = clientes:where("endereco.uf", "SP"):order_by("-saldo"):all()?
+    for _, c in paulistas do
+        printf("  #%d %s (%s/%s) - Saldo: R$ %.2f - Pedidos: %d\n",
+            c.id, c.nome, c.endereco.cidade, c.endereco.uf, c.saldo, len(c.pedidos))
+    end
+
+    -- Transferência dentro de uma transação
+    local _ = db:transaction(function(tx)
+        local tx_c = tx:model(Clientes)
+        local _ = tx_c:where("nome", "Beatriz"):update({saldo = 2600.0})?
+        local _ = tx_c:where("nome", "Carlos"):update({saldo = 950.0})?
+        return true
+    end)?
+
+    local carlos = clientes:where("nome", "Carlos"):first()?
+    local beatriz = clientes:where("nome", "Beatriz"):first()?
+    printf("\nApós transação -> Beatriz: R$ %.2f | Carlos: R$ %.2f\n", beatriz.saldo, carlos.saldo)
+end
+
+local err = main()
+if is_error(err) then panic(err.message) end

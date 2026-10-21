@@ -1,0 +1,98 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- driver — driver registry and contract verification for RDD
+--
+-- A driver is a table/struct with at least:
+--   open(opts) → conn | error
+--
+-- And the connection returned by open(opts) implements:
+--   conn:insert(schema, doc)                 → inserted_doc | error
+--   conn:find(schema, plan)                  → array of docs | error
+--   conn:update(schema, plan, changes)       → updated_count (int) | error
+--   conn:delete(schema, plan)                → deleted_count (int) | error
+--   conn:close()                             → true | nil | error
+--
+-- Optional connection methods (RDD provides fallbacks or no-ops when absent):
+--   conn:migrate(schema)                     → true | error
+--   conn:insert_many(schema, docs)           → array of inserted_docs | error
+--   conn:count(schema, plan)                 → int | error
+--   conn:transaction(fn)                     → result of fn(conn) | error
+
+local M = {}
+
+local registry = [=]
+
+local REQUIRED_CONN_METHODS = ["insert", "find", "update", "delete", "close"]
+
+local function is_record(v)
+    local t = type(v)
+    return t == "table" or t == "struct" or t == "map"
+end
+
+-- driver.validate(name, drv) → true | error
+function M.validate(name, drv)
+    if type(name) ~= "string" or string.trim(name) == "" then
+        return error("rdd: driver name must be a non-empty string")
+    end
+    if not is_record(drv) then
+        return error(`rdd: driver '${name}' must be a table or struct, got ${type(drv)}`)
+    end
+    if type(drv.open) ~= "function" then
+        return error(`rdd: driver '${name}' must implement open(opts)`)
+    end
+    return true
+end
+
+-- driver.validate_connection(name, conn) → true | error
+function M.validate_connection(name, conn)
+    if not is_record(conn) then
+        return error(`rdd: driver '${name}' open() must return a connection table, got ${type(conn)}`)
+    end
+    for _, method in REQUIRED_CONN_METHODS do
+        if type(conn[method]) ~= "function" then
+            return error(`rdd: driver '${name}' connection is missing required method '${method}'`)
+        end
+    end
+    return true
+end
+
+-- driver.register(name, drv) → true | error
+function M.register(name, drv)
+    local _ = M.validate(name, drv)?
+    registry[name] = drv
+    return true
+end
+
+-- driver.unregister(name) → bool
+function M.unregister(name)
+    local _, ok = registry[name]
+    if not ok then return false end
+    del registry[name]
+    return true
+end
+
+-- driver.get(name) → drv | error
+function M.get(name)
+    local drv, ok = registry[name]
+    if not ok or drv == nil then
+        return error(`rdd: unknown driver '${tostring(name)}' (register it first with rdd.register_driver)`)
+    end
+    return drv
+end
+
+-- driver.has(name) → bool
+function M.has(name)
+    local drv, ok = registry[name]
+    return ok and drv ~= nil
+end
+
+-- driver.list() → sorted array of registered driver names
+function M.list()
+    local names = []
+    for k, _ in registry do names[] = k end
+    sort.sort(names)
+    return names
+end
+
+return M

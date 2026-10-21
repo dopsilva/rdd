@@ -1,0 +1,497 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+local t = require("sea/test")
+local sqlite = require("../sea_vm/libs/sqlite/sqlite")
+local rdd = require("./rdd")
+
+-- ---- Helper: Minimal SQLite driver registered for testing RDD contracts ----
+
+local function sql_col_expr(schema, field_path)
+    local parts = string.split(field_path, ".")
+    local root = parts[0]
+    if len(parts) == 1 then return root end
+    local f = schema:field(root)
+    if f ~= nil and (f.type == "document" or f.type == "map") then
+        local json_path = "$." .. string.join(list.slice(parts, 1), ".")
+        return `json_extract(${root}, '${json_path}')`
+    end
+    return field_path
+end
+
+local function bind_val(v)
+    if type(v) == "bool" then return v and 1 or 0 end
+    if type(v) == "table" or type(v) == "struct" or type(v) == "map" or type(v) == "array" then
+        return json.encode(v)
+    end
+    return v
+end
+
+local compile_filters
+
+compile_filters = function(schema, filters, params)
+    if len(filters) == 0 then return "" end
+    local clauses = []
+    for i, node in filters do
+        local prefix = ""
+        if i > 0 then
+            prefix = (node.logic == "or") and " OR " or " AND "
+        end
+        if node.kind == "group" then
+            local inner = compile_filters(schema, node.filters, params)
+            if inner ~= "" then
+                clauses[] = `${prefix}(${inner})`
+            end
+        else
+            local col = sql_col_expr(schema, node.field)
+            local op = node.op
+            if op == "is_null" then
+                clauses[] = `${prefix}${col} IS NULL`
+            elseif op == "is_not_null" then
+                clauses[] = `${prefix}${col} IS NOT NULL`
+            elseif op == "in" or op == "not_in" then
+                local ph = []
+                for _, item in node.value do
+                    ph[] = "?"
+                    params[] = bind_val(item)
+                end
+                local kw = (op == "in") and "IN" or "NOT IN"
+                clauses[] = `${prefix}${col} ${kw} (${string.join(ph, ", ")})`
+            elseif op == "between" then
+                clauses[] = `${prefix}${col} BETWEEN ? AND ?`
+                params[] = bind_val(node.value[0])
+                params[] = bind_val(node.value[1])
+            elseif op == "contains" then
+                clauses[] = `${prefix}${col} LIKE ?`
+                params[] = `%${node.value}%`
+            elseif op == "starts_with" then
+                clauses[] = `${prefix}${col} LIKE ?`
+                params[] = `${node.value}%`
+            elseif op == "ends_with" then
+                clauses[] = `${prefix}${col} LIKE ?`
+                params[] = `%${node.value}`
+            else
+                clauses[] = `${prefix}${col} ${op} ?`
+                params[] = bind_val(node.value)
+            end
+        end
+    end
+    return string.join(clauses, "")
+end
+
+local function hydrate_row(schema, row, projected_fields)
+    if row == nil then return nil end
+    local out = {}
+    local cols = len(projected_fields) > 0 and projected_fields or schema.field_order
+    for _, fname in cols do
+        local f = schema:field(fname)
+        local raw = row[fname]
+        if raw ~= nil and f ~= nil then
+            if f.type == "bool" then
+                out[fname] = (raw == 1 or raw == true)
+            elseif (f.type == "document" or f.type == "array" or f.type == "map") and type(raw) == "string" then
+                out[fname] = json.decode(raw)
+            else
+                out[fname] = raw
+            end
+        else
+            out[fname] = raw
+        end
+    end
+    return out
+end
+
+local function make_sqlite_driver()
+    local Conn = {}
+
+    function Conn.migrate(self, schema)
+        local cols = []
+        for _, fname in schema.field_order do
+            local f = schema.fields[fname]
+            local col_type = "TEXT"
+            if f.type == "int" or f.type == "bool" then
+                col_type = "INTEGER"
+            elseif f.type == "number" then
+                col_type = "REAL"
+            end
+            local def = `${fname} ${col_type}`
+            if f.primary_key then
+                def ..= " PRIMARY KEY"
+                if f.auto == true and f.type == "int" then def ..= " AUTOINCREMENT" end
+            end
+            if f.unique then def ..= " UNIQUE" end
+            cols[] = def
+        end
+        local sql = `CREATE TABLE IF NOT EXISTS ${schema.name} (${string.join(cols, ", ")})`
+        local _ = self.db:exec(sql)?
+        return true
+    end
+
+    function Conn.insert(self, schema, doc)
+        local cols = []
+        local ph = []
+        local params = []
+        for _, fname in schema.field_order do
+            if doc[fname] ~= nil then
+                cols[] = fname
+                ph[] = "?"
+                params[] = bind_val(doc[fname])
+            end
+        end
+        local sql = `INSERT INTO ${schema.name} (${string.join(cols, ", ")}) VALUES (${string.join(ph, ", ")})`
+        local _ = self.db:exec(sql, params)?
+        local out = {}
+        for k, v in doc do out[k] = v end
+        local pk = schema.primary_key
+        if pk ~= nil and out[pk] == nil then
+            out[pk] = self.db:last_insert_id()
+        end
+        return out
+    end
+
+    function Conn.find(self, schema, plan)
+        local select_cols = "*"
+        if len(plan.fields) > 0 then
+            select_cols = string.join(plan.fields, ", ")
+        end
+        local params = []
+        local sql = `SELECT ${select_cols} FROM ${plan.collection}`
+        local where_sql = compile_filters(schema, plan.filters, params)
+        if where_sql ~= "" then sql ..= ` WHERE ${where_sql}` end
+        if len(plan.orders) > 0 then
+            local ord = []
+            for _, o in plan.orders do
+                ord[] = `${sql_col_expr(schema, o.field)} ${string.upper(o.dir)}`
+            end
+            sql ..= ` ORDER BY ${string.join(ord, ", ")}`
+        end
+        if plan.limit ~= nil then
+            sql ..= ` LIMIT ${plan.limit}`
+        end
+        if plan.offset ~= nil then
+            if plan.limit == nil then sql ..= " LIMIT -1" end
+            sql ..= ` OFFSET ${plan.offset}`
+        end
+        local rows = self.db:query(sql, params)?
+        local out = []
+        for _, r in rows do
+            out[] = hydrate_row(schema, r, plan.fields)
+        end
+        return out
+    end
+
+    function Conn.count(self, schema, plan)
+        local params = []
+        local sql = `SELECT count(*) FROM ${plan.collection}`
+        local where_sql = compile_filters(schema, plan.filters, params)
+        if where_sql ~= "" then sql ..= ` WHERE ${where_sql}` end
+        if plan.limit ~= nil then
+            sql = `SELECT count(*) FROM (${sql} LIMIT ${plan.limit})`
+        end
+        return self.db:value(sql, params)
+    end
+
+    function Conn.update(self, schema, plan, changes)
+        local sets = []
+        local params = []
+        for _, k in list.keys(changes) do
+            local v = changes[k]
+            if string.contains(k, ".") then
+                local parts = string.split(k, ".")
+                local root = parts[0]
+                local json_path = "$." .. string.join(list.slice(parts, 1), ".")
+                sets[] = `${root} = json_set(COALESCE(${root}, '{}'), '${json_path}', ?)`
+                params[] = bind_val(v)
+            else
+                sets[] = `${k} = ?`
+                params[] = bind_val(v)
+            end
+        end
+        local sql = `UPDATE ${plan.collection} SET ${string.join(sets, ", ")}`
+        local where_sql = compile_filters(schema, plan.filters, params)
+        if where_sql ~= "" then sql ..= ` WHERE ${where_sql}` end
+        return self.db:exec(sql, params)
+    end
+
+    function Conn.delete(self, schema, plan)
+        local params = []
+        local sql = `DELETE FROM ${plan.collection}`
+        local where_sql = compile_filters(schema, plan.filters, params)
+        if where_sql ~= "" then sql ..= ` WHERE ${where_sql}` end
+        return self.db:exec(sql, params)
+    end
+
+    function Conn.transaction(self, fn)
+        return self.db:transaction(function(_)
+            return fn(self)
+        end)
+    end
+
+    function Conn.close(self)
+        return self.db:close()
+    end
+
+    return {
+        open = function(opts)
+            local db = sqlite.open(opts.path or ":memory:")?
+            local c = {}
+            c.db = db
+            for k, f in Conn do c[k] = f end
+            return c
+        end,
+    }
+end
+
+-- ---- Test Suites ----
+
+local Endereco = rdd.schema("enderecos", {
+    rua = {type = "string", required = true},
+    numero = "int",
+    cidade = {type = "string", required = true},
+    uf = {type = "string", default_val = "SP", min = 2, max = 2},
+})
+
+local Clientes = rdd.schema("clientes", {
+    id = {type = "int", primary_key = true, auto = true},
+    nome = {type = "string", required = true, min = 2},
+    email = {type = "string", unique = true},
+    ativo = {type = "bool", default_val = true},
+    saldo = {type = "number", default_val = 0.0},
+    endereco = Endereco,
+    tags = {type = "array", items = "string"},
+    contatos = {
+        type = "array",
+        items = {
+            tipo = {type = "string", required = true},
+            valor = {type = "string", required = true},
+        },
+    },
+})
+
+t.describe("rdd driver registry", function()
+    t.it("registers, lists, and unregisters drivers", function()
+        t.is_error(rdd.register_driver("", {}), "non-empty string")
+        t.is_error(rdd.register_driver("bad", {}), "must implement open")
+
+        local ok = rdd.register_driver("dummy", {
+            open = function(_) return error("not implemented") end,
+        })
+        t.no_error(ok)
+        t.ok(rdd.has_driver("dummy"))
+        t.contains(rdd.drivers(), "dummy")
+
+        t.ok(rdd.unregister_driver("dummy"))
+        t.no(rdd.has_driver("dummy"))
+    end)
+
+    t.it("validates connection contract on open", function()
+        rdd.register_driver("incomplete", {
+            open = function(_)
+                return {insert = function() end}
+            end,
+        })
+        defer rdd.unregister_driver("incomplete")
+
+        local db = rdd.open("incomplete")
+        t.is_error(db, "missing required method 'find'")
+    end)
+end)
+
+t.describe("rdd schema and nested document validation", function()
+    t.it("validates flat and chained document fields with defaults", function()
+        local doc = t.no_error(Clientes:validate({
+            nome = "Maria Silva",
+            email = "maria@example.com",
+            endereco = {
+                rua = "Av. Paulista",
+                numero = 1000,
+                cidade = "São Paulo",
+            },
+            tags = ["vip", "varejo"],
+            contatos = [
+                {tipo = "celular", valor = "11999999999"},
+                {tipo = "email", valor = "maria@example.com"},
+            ],
+        }))
+
+        t.eq(doc.nome, "Maria Silva")
+        t.eq(doc.ativo, true)
+        t.eq(doc.saldo, 0.0)
+        t.eq(doc.endereco.uf, "SP")
+        t.eq(doc.endereco.cidade, "São Paulo")
+        t.eq(len(doc.tags), 2)
+        t.eq(doc.contatos[0].tipo, "celular")
+    end)
+
+    t.it("reports clear dot-path errors on nested fields and arrays", function()
+        local err1 = Clientes:validate({
+            nome = "Joao",
+            endereco = {rua = "Rua A"},
+        })
+        t.is_error(err1, "clientes.endereco.cidade' is required")
+
+        local err2 = Clientes:validate({
+            nome = "Joao",
+            contatos = [{tipo = "tel"}],
+        })
+        t.is_error(err2, "clientes.contatos[0].valor' is required")
+
+        local err3 = Clientes:validate({
+            nome = "Joao",
+            campo_fantasma = 123,
+        })
+        t.is_error(err3, "unknown field 'clientes.campo_fantasma'")
+    end)
+
+    t.it("resolves dot-paths and validates partial updates", function()
+        local uf_field = Clientes:field_at("endereco.uf")
+        t.not_nil(uf_field)
+        t.eq(uf_field.type, "string")
+
+        local ch = t.no_error(Clientes:validate_changes({
+            saldo = 250.5,
+            ["endereco.cidade"] = "Campinas",
+        }))
+        t.eq(ch.saldo, 250.5)
+        t.eq(ch["endereco.cidade"], "Campinas")
+
+        t.is_error(Clientes:validate_changes({["endereco.uf"] = "S"}), "length must be >= 2")
+        t.is_error(Clientes:validate_changes({inexistente = 1}), "unknown field")
+    end)
+end)
+
+t.describe("rdd query builder and abstract query plan (AST)", function()
+    t.it("builds a driver-agnostic AST for complex queries", function()
+        local q = rdd.query(Clientes):fields("id", "nome", "endereco.cidade"):where("ativo", true):where("saldo", ">=", 100):where("endereco.uf", "SP"):or_where(function(sub)
+            sub:where("endereco.uf", "RJ"):where_in("nome", ["Ana", "Bia"])
+        end):order_by("-saldo"):order_by("nome", "asc"):limit(20):offset(40)
+
+        local plan = t.no_error(q:to_plan())
+        t.eq(plan.collection, "clientes")
+        t.eq(plan.fields, ["id", "nome", "endereco.cidade"])
+        t.eq(len(plan.filters), 4)
+        t.eq(plan.filters[0], {kind = "cond", logic = "and", field = "ativo", op = "=", value = true})
+        t.eq(plan.filters[1], {kind = "cond", logic = "and", field = "saldo", op = ">=", value = 100})
+        t.eq(plan.filters[2], {kind = "cond", logic = "and", field = "endereco.uf", op = "=", value = "SP"})
+        t.eq(plan.filters[3].kind, "group")
+        t.eq(plan.filters[3].logic, "or")
+        t.eq(len(plan.filters[3].filters), 2)
+        t.eq(plan.orders, [{field = "saldo", dir = "desc"}, {field = "nome", dir = "asc"}])
+        t.eq(plan.limit, 20)
+        t.eq(plan.offset, 40)
+    end)
+
+    t.it("catches unknown fields in fluent query chains", function()
+        local q = rdd.query(Clientes):where("endereco.pais", "BR"):order_by("nome")
+        t.is_error(q:to_plan(), "unknown field 'clientes.endereco.pais'")
+    end)
+end)
+
+t.describe("rdd end-to-end with registered SQLite driver", function()
+    local db = nil
+    local model = nil
+
+    t.before_all(function()
+        rdd.register_driver("sqlite_test", make_sqlite_driver())
+    end)
+
+    t.after_all(function()
+        rdd.unregister_driver("sqlite_test")
+    end)
+
+    t.before_each(function()
+        db = t.no_error(rdd.open("sqlite_test", {path = ":memory:"}))
+        t.no_error(db:migrate(Clientes))
+        model = db:model(Clientes)
+    end)
+
+    t.after_each(function()
+        if db ~= nil then db:close() end
+    end)
+
+    t.it("inserts, queries nested fields, updates, and deletes", function()
+        local c1 = t.no_error(model:insert({
+            nome = "Ana Costa",
+            email = "ana@example.com",
+            saldo = 1500.0,
+            endereco = {rua = "Rua das Flores", numero = 10, cidade = "São Paulo", uf = "SP"},
+            tags = ["ouro"],
+            contatos = [{tipo = "whatsapp", valor = "11988887777"}],
+        }))
+        t.eq(c1.id, 1)
+
+        local _ = t.no_error(model:insert_many([
+            {
+                nome = "Bruno Lima",
+                email = "bruno@example.com",
+                saldo = 300.0,
+                endereco = {rua = "Av. Atlântica", numero = 500, cidade = "Rio de Janeiro", uf = "RJ"},
+                tags = ["prata"],
+            },
+            {
+                nome = "Carla Souza",
+                email = "carla@example.com",
+                ativo = false,
+                saldo = 2500.0,
+                endereco = {rua = "Rua XV", numero = 99, cidade = "Campinas", uf = "SP"},
+                tags = ["ouro", "vip"],
+            },
+        ]))
+
+        t.eq(t.no_error(model:count()), 3)
+
+        -- Find by primary key and verify nested structures are preserved
+        local found = t.no_error(model:find(1))
+        t.not_nil(found)
+        t.eq(found.nome, "Ana Costa")
+        t.eq(found.endereco.cidade, "São Paulo")
+        t.eq(found.tags, ["ouro"])
+        t.eq(found.contatos[0].valor, "11988887777")
+
+        -- Query by nested document field ("endereco.uf") + ordering
+        local paulistas = t.no_error(
+            model:where("endereco.uf", "SP"):order_by("-saldo"):all()
+        )
+        t.eq(len(paulistas), 2)
+        t.eq(paulistas[0].nome, "Carla Souza")
+        t.eq(paulistas[1].nome, "Ana Costa")
+
+        -- Partial update including nested dot-path
+        local updated = t.no_error(
+            model:where("id", 2):update({
+                saldo = 450.0,
+                ["endereco.cidade"] = "Niterói",
+            })
+        )
+        t.eq(updated, 1)
+
+        local bruno = t.no_error(model:find(2))
+        t.eq(bruno.saldo, 450.0)
+        t.eq(bruno.endereco.cidade, "Niterói")
+        t.eq(bruno.endereco.uf, "RJ")
+
+        -- Delete inactive records
+        local deleted = t.no_error(model:where("ativo", false):delete())
+        t.eq(deleted, 1)
+        t.eq(t.no_error(model:count()), 2)
+    end)
+
+    t.it("supports transactions and rolls back on error", function()
+        local _ = t.no_error(model:insert({
+            nome = "Daniel",
+            email = "daniel@example.com",
+            saldo = 1000.0,
+        }))
+
+        local res = db:transaction(function(tx)
+            local tx_clientes = tx:model(Clientes)
+            local _ = tx_clientes:insert({
+                nome = "Temp User",
+                email = "temp@example.com",
+            })?
+            return error("abort transaction")
+        end)
+        t.is_error(res, "abort transaction")
+        t.eq(t.no_error(model:count()), 1)
+    end)
+end)

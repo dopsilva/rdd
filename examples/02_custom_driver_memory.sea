@@ -1,0 +1,235 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- 02_custom_driver_memory.sea — Criando e registrando um driver orientado a documentos
+--
+-- Demonstra como implementar o contrato de driver do RDD para um banco de
+-- documentos/objetos (estilo MongoDB / S3 / Key-Value em memória), onde os
+-- sub-documentos são armazenados nativamente sem achatar tabelas.
+--
+-- Execução:
+--   ~/projects/sea_vm/bin/sea examples/02_custom_driver_memory.sea
+
+local rdd = require("../rdd")
+
+-- Resolve um caminho "endereco.cidade" dentro de um documento aninhado
+local function get_path(doc, path)
+    local parts = string.split(path, ".")
+    local curr = doc
+    for _, p in parts do
+        if type(curr) ~= "table" and type(curr) ~= "struct" and type(curr) ~= "map" then
+            return nil
+        end
+        curr = curr[p]
+    end
+    return curr
+end
+
+-- Define um valor em um caminho "endereco.cidade" dentro de um documento
+local function set_path(doc, path, val)
+    local parts = string.split(path, ".")
+    local curr = doc
+    for i = 0, len(parts) - 2 do
+        local p = parts[i]
+        if curr[p] == nil then curr[p] = {} end
+        curr = curr[p]
+    end
+    curr[parts[-1]] = val
+end
+
+-- Avalia recursivamente os filtros da AST do RDD sobre um documento
+local match_filters
+
+local function match_cond(doc, node)
+    local v = get_path(doc, node.field)
+    local op = node.op
+    local target = node.value
+    if op == "=" then return v == target end
+    if op == "!=" then return v ~= target end
+    if op == "is_null" then return v == nil end
+    if op == "is_not_null" then return v ~= nil end
+    if v == nil then return false end
+    if op == "<" then return v < target end
+    if op == "<=" then return v <= target end
+    if op == ">" then return v > target end
+    if op == ">=" then return v >= target end
+    if op == "between" then return v >= target[0] and v <= target[1] end
+    if op == "in" then return list.contains(target, v) end
+    if op == "not_in" then return not list.contains(target, v) end
+    if op == "contains" then return string.contains(tostring(v), tostring(target)) end
+    if op == "starts_with" then return string.starts_with(tostring(v), tostring(target)) end
+    if op == "ends_with" then return string.ends_with(tostring(v), tostring(target)) end
+    return false
+end
+
+match_filters = function(doc, filters)
+    if len(filters) == 0 then return true end
+    local result = true
+    for i, node in filters do
+        local matched = false
+        if node.kind == "group" then
+            matched = match_filters(doc, node.filters)
+        else
+            matched = match_cond(doc, node)
+        end
+        if i == 0 then
+            result = matched
+        elseif node.logic == "or" then
+            result = result or matched
+        else
+            result = result and matched
+        end
+    end
+    return result
+end
+
+-- Registro do driver "memory_doc"
+rdd.register_driver("memory_doc", {
+    open = function(_)
+        local store = [=]
+        local seq = [=]
+        local conn = {}
+
+        local function bucket(name)
+            local b, ok = store[name]
+            if not ok then
+                b = []
+                store[name] = b
+                seq[name] = 0
+            end
+            return b
+        end
+
+        function conn.insert(_, schema, doc)
+            local b = bucket(schema.name)
+            local copy = json.decode(json.encode(doc))
+            local pk = schema.primary_key
+            if pk ~= nil and copy[pk] == nil then
+                seq[schema.name] += 1
+                copy[pk] = seq[schema.name]
+            end
+            b[] = copy
+            return json.decode(json.encode(copy))
+        end
+
+        function conn.find(_, schema, plan)
+            local b = bucket(schema.name)
+            local out = []
+            for _, doc in b do
+                if match_filters(doc, plan.filters) then
+                    out[] = json.decode(json.encode(doc))
+                end
+            end
+            -- Ordenação
+            if len(plan.orders) > 0 then
+                sort.sort(out, function(a, b_doc)
+                    for _, o in plan.orders do
+                        local va = get_path(a, o.field)
+                        local vb = get_path(b_doc, o.field)
+                        if va ~= vb then
+                            if o.dir == "desc" then return va > vb end
+                            return va < vb
+                        end
+                    end
+                    return false
+                end)
+            end
+            -- Paginação (offset / limit)
+            local start = plan.offset or 0
+            local stop = len(out)
+            if plan.limit ~= nil and start + plan.limit < stop then
+                stop = start + plan.limit
+            end
+            local sliced = list.slice(out, start, stop)
+            -- Projeção de campos (se especificada)
+            if len(plan.fields) > 0 then
+                local projected = []
+                for _, d in sliced do
+                    local p = {}
+                    for _, f in plan.fields do p[f] = get_path(d, f) end
+                    projected[] = p
+                end
+                return projected
+            end
+            return sliced
+        end
+
+        function conn.update(_, schema, plan, changes)
+            local b = bucket(schema.name)
+            local updated = 0
+            for _, doc in b do
+                if match_filters(doc, plan.filters) then
+                    for k, v in changes do set_path(doc, k, v) end
+                    updated += 1
+                end
+            end
+            return updated
+        end
+
+        function conn.delete(_, schema, plan)
+            local b = bucket(schema.name)
+            local kept = []
+            local deleted = 0
+            for _, doc in b do
+                if match_filters(doc, plan.filters) then
+                    deleted += 1
+                else
+                    kept[] = doc
+                end
+            end
+            store[schema.name] = kept
+            return deleted
+        end
+
+        function conn.close(_)
+            return true
+        end
+
+        return conn
+    end,
+})
+
+-- ---- Uso da aplicação (independente do driver) ----
+
+local Clientes = rdd.schema("clientes", {
+    id = {type = "int", primary_key = true, auto = true},
+    nome = {type = "string", required = true},
+    ativo = {type = "bool", default_val = true},
+    saldo = {type = "number", default_val = 0.0},
+    endereco = {
+        cidade = {type = "string", required = true},
+        uf = {type = "string", default_val = "SP"},
+    },
+})
+
+local function main()
+    local db = rdd.open("memory_doc")?
+    defer db:close()
+
+    local clientes = db:model(Clientes)
+
+    local _ = clientes:insert_many([
+        {nome = "Ana", saldo = 1200.0, endereco = {cidade = "São Paulo", uf = "SP"}},
+        {nome = "Carlos", saldo = 450.0, endereco = {cidade = "Curitiba", uf = "PR"}},
+        {nome = "Beatriz", saldo = 3100.0, endereco = {cidade = "Campinas", uf = "SP"}},
+    ])?
+
+    print("=== Clientes de SP ordenados por maior saldo ===")
+    local paulistas = clientes:where("endereco.uf", "SP"):order_by("-saldo"):all()?
+    for _, c in paulistas do
+        printf("  #%d %s (%s/%s) - R$ %.2f\n", c.id, c.nome, c.endereco.cidade, c.endereco.uf, c.saldo)
+    end
+
+    -- Atualizando sub-documento via dot-notation
+    local _ = clientes:where("nome", "Carlos"):update({
+        saldo = 900.0,
+        ["endereco.cidade"] = "Londrina",
+    })?
+
+    local carlos = clientes:where("nome", "Carlos"):first()?
+    printf("\nApós update -> %s agora mora em %s/%s com saldo R$ %.2f\n",
+        carlos.nome, carlos.endereco.cidade, carlos.endereco.uf, carlos.saldo)
+end
+
+local err = main()
+if is_error(err) then panic(err.message) end

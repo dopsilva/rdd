@@ -1,0 +1,243 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- rdd — Replaceable Database Driver ORM for Sea
+--
+-- Write data schemas (flat or nested documents) and fluent queries once,
+-- independent of the underlying storage engine (MongoDB, PostgreSQL, SQLite,
+-- SQL Server, CockroachDB, S3, etc.). Drivers are registered via
+-- rdd.register_driver(name, driver_impl).
+
+local driver = require("./driver")
+local schema_mod = require("./schema")
+local query_mod = require("./query")
+
+local M = {}
+
+local Session = {}
+local Model = {}
+
+local function with_methods(obj, methods)
+    for k, f in methods do obj[k] = f end
+    return obj
+end
+
+-- ---- Driver registration API ----
+
+M.register_driver = driver.register
+M.unregister_driver = driver.unregister
+M.get_driver = driver.get
+M.has_driver = driver.has
+M.drivers = driver.list
+
+-- ---- Schema & Query builders ----
+
+M.schema = schema_mod.new
+M.field = schema_mod.field
+M.query = query_mod.new
+
+-- ---- Model (Schema bound to a Session) ----
+
+local function new_model(session, sch)
+    local m = {}
+    m.session = session
+    m.conn = session.conn
+    m.schema = sch
+    m.name = sch.name
+    return with_methods(m, Model)
+end
+
+-- model:migrate() → true | error
+function Model.migrate(self)
+    if type(self.conn.migrate) == "function" then
+        return self.conn:migrate(self.schema)
+    end
+    return true
+end
+
+-- model:query() → Query
+function Model.query(self)
+    return query_mod.new(self.schema, self.conn)
+end
+
+-- model:insert(doc) → inserted_doc | error
+function Model.insert(self, doc)
+    local valid = self.schema:validate(doc)?
+    return self.conn:insert(self.schema, valid)
+end
+
+-- model:insert_many(docs) → array of inserted_docs | error
+function Model.insert_many(self, docs)
+    if type(docs) ~= "array" then
+        return error(`rdd: insert_many on '${self.name}' expects an array of documents, got ${type(docs)}`)
+    end
+    local valid_docs = []
+    for _, d in docs do
+        valid_docs[] = self.schema:validate(d)?
+    end
+    if len(valid_docs) == 0 then return [] end
+
+    if type(self.conn.insert_many) == "function" then
+        return self.conn:insert_many(self.schema, valid_docs)
+    end
+
+    return self.session:transaction(function(tx)
+        local tx_model = tx:model(self.schema)
+        local out = []
+        for _, vd in valid_docs do
+            out[] = tx_model.conn:insert(self.schema, vd)?
+        end
+        return out
+    end)
+end
+
+-- model:find(id) → doc | nil | error
+function Model.find(self, id)
+    local pk = self.schema.primary_key
+    if pk == nil then
+        return error(`rdd: schema '${self.name}' has no primary key for find(id)`)
+    end
+    return self:where(pk, id):first()
+end
+
+-- model:update_by_id(id, changes) → updated_count (int) | error
+function Model.update_by_id(self, id, changes)
+    local pk = self.schema.primary_key
+    if pk == nil then
+        return error(`rdd: schema '${self.name}' has no primary key for update_by_id(id, changes)`)
+    end
+    return self:where(pk, id):update(changes)
+end
+
+-- model:delete_by_id(id) → deleted_count (int) | error
+function Model.delete_by_id(self, id)
+    local pk = self.schema.primary_key
+    if pk == nil then
+        return error(`rdd: schema '${self.name}' has no primary key for delete_by_id(id)`)
+    end
+    return self:where(pk, id):delete()
+end
+
+-- model:save(doc) → saved_doc | error
+-- Inserts if primary key is nil or not found; updates otherwise.
+function Model.save(self, doc)
+    local pk = self.schema.primary_key
+    if pk == nil or doc == nil or doc[pk] == nil then
+        return self:insert(doc)
+    end
+    local valid = self.schema:validate(doc)?
+    local pk_val = valid[pk]
+    local exists = self:where(pk, pk_val):exists()?
+    if not exists then
+        return self.conn:insert(self.schema, valid)
+    end
+    local changes = {}
+    local has_changes = false
+    for k, v in valid do
+        if k ~= pk then
+            changes[k] = v
+            has_changes = true
+        end
+    end
+    if has_changes then
+        local _ = self:where(pk, pk_val):update(changes)?
+    end
+    return valid
+end
+
+-- Fluent query starters on Model
+function Model.where(self, ...)
+    local q = self:query()
+    return q.where(q, ...)
+end
+function Model.and_where(self, ...)
+    local q = self:query()
+    return q.and_where(q, ...)
+end
+function Model.or_where(self, ...)
+    local q = self:query()
+    return q.or_where(q, ...)
+end
+function Model.where_in(self, field, values) return self:query():where_in(field, values) end
+function Model.where_not_in(self, field, values) return self:query():where_not_in(field, values) end
+function Model.where_null(self, field) return self:query():where_null(field) end
+function Model.where_not_null(self, field) return self:query():where_not_null(field) end
+function Model.where_between(self, field, low, high) return self:query():where_between(field, low, high) end
+function Model.fields(self, ...)
+    local q = self:query()
+    return q.fields(q, ...)
+end
+function Model.project(self, ...)
+    local q = self:query()
+    return q.project(q, ...)
+end
+function Model.order_by(self, field, dir) return self:query():order_by(field, dir) end
+function Model.limit(self, n) return self:query():limit(n) end
+function Model.offset(self, n) return self:query():offset(n) end
+function Model.all(self) return self:query():all() end
+function Model.first(self) return self:query():first() end
+function Model.one(self) return self:query():one() end
+function Model.count(self) return self:query():count() end
+function Model.exists(self) return self:query():exists() end
+function Model.each(self, fn) return self:query():each(fn) end
+
+-- ---- Session (Database connection wrapper) ----
+
+local function new_session(driver_name, conn)
+    local s = {}
+    s.driver_name = driver_name
+    s.conn = conn
+    s._models = [=]
+    return with_methods(s, Session)
+end
+
+-- db:model(schema) → Model | error
+function Session.model(self, sch)
+    if type(sch) ~= "table" and type(sch) ~= "struct" or not sch.__is_schema then
+        return error("rdd: db:model(schema) expects a Schema created with rdd.schema()")
+    end
+    local cached, ok = self._models[sch.name]
+    if ok and cached.schema == sch then return cached end
+    local m = new_model(self, sch)
+    self._models[sch.name] = m
+    return m
+end
+
+-- db:migrate(schemas...) → true | error
+function Session.migrate(self, ...)
+    local schemas = {...}
+    if len(schemas) == 1 and type(schemas[0]) == "array" then
+        schemas = schemas[0]
+    end
+    for _, sch in schemas do
+        local m = self:model(sch)?
+        local _ = m:migrate()?
+    end
+    return true
+end
+
+-- db:transaction(fn) → result of fn(tx_session) | error
+function Session.transaction(self, fn)
+    if type(self.conn.transaction) == "function" then
+        return self.conn:transaction(function(tx_conn)
+            local tx_session = new_session(self.driver_name, tx_conn or self.conn)
+            return fn(tx_session)
+        end)
+    end
+    return fn(self)
+end
+
+-- db:close() → true | nil | error
+function Session.close(self)
+    return self.conn:close()
+end
+
+-- rdd.open(driver_name [, opts]) → Session | error
+function M.open(driver_name, opts)
+    local drv = driver.get(driver_name)?
+    local conn = drv.open(opts or {})?
+    local _ = driver.validate_connection(driver_name, conn)?
+    return new_session(driver_name, conn)
+end
+
+return M

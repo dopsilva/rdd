@@ -1,0 +1,489 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- schema — declarative data structures (flat and nested documents) for RDD
+
+local M = {}
+
+local VALID_TYPES = {
+    string = true,
+    int = true,
+    number = true,
+    bool = true,
+    bytes = true,
+    time = true,
+    uuid = true,
+    map = true,
+    any = true,
+    document = true,
+    array = true,
+}
+
+local Schema = {}
+local Field = {}
+
+local function is_record(v)
+    local t = type(v)
+    return t == "table" or t == "struct" or t == "map"
+end
+
+local function with_methods(obj, methods)
+    for k, f in methods do obj[k] = f end
+    return obj
+end
+
+local function copy_opts(opts)
+    local out = {}
+    if opts == nil then return out end
+    for k, v in opts do out[k] = v end
+    return out
+end
+
+-- Forward declaration for mutual recursion between normalize_field and M.new
+local normalize_field
+
+normalize_field = function(field_name, spec, parent_name)
+    local full_name = parent_name and `${parent_name}.${field_name}` or field_name
+    local f = {}
+    f.name = field_name
+
+    if type(spec) == "string" then
+        if not VALID_TYPES[spec] then
+            return error(`rdd: invalid type '${spec}' for field '${full_name}'`)
+        end
+        f.type = spec
+        f.required = false
+        f.primary_key = false
+        f.auto = false
+        f.unique = false
+        f.index = false
+        return f
+    end
+
+    if not is_record(spec) then
+        return error(`rdd: field '${full_name}' definition must be a string, table, or schema, got ${type(spec)}`)
+    end
+
+    -- Direct Schema object used as a nested document field
+    if spec.__is_schema then
+        f.type = "document"
+        f.schema = spec
+        f.required = false
+        f.primary_key = false
+        f.auto = false
+        f.unique = false
+        f.index = false
+        return f
+    end
+
+    -- Inline nested document: table/struct without a 'type' key
+    if spec.type == nil then
+        local sub = M.new(full_name, spec)?
+        f.type = "document"
+        f.schema = sub
+        f.required = false
+        f.primary_key = false
+        f.auto = false
+        f.unique = false
+        f.index = false
+        return f
+    end
+
+    -- Nested Schema passed as spec.type
+    if is_record(spec.type) and spec.type.__is_schema then
+        f.type = "document"
+        f.schema = spec.type
+    elseif type(spec.type) == "string" and VALID_TYPES[spec.type] then
+        f.type = spec.type
+    else
+        return error(`rdd: invalid type '${tostring(spec.type)}' for field '${full_name}'`)
+    end
+
+    f.required = spec.required == true
+    f.primary_key = spec.primary_key == true
+    f.auto = spec.auto or false
+    f.unique = spec.unique == true
+    f.index = spec.index == true
+    f.default_val = spec.default_val
+    if f.default_val == nil and spec["default"] ~= nil then
+        f.default_val = spec["default"]
+    end
+    f.min = spec.min
+    f.max = spec.max
+    f.validate = spec.validate
+
+    if f.type == "document" and f.schema == nil then
+        if spec.schema ~= nil and is_record(spec.schema) and spec.schema.__is_schema then
+            f.schema = spec.schema
+        elseif is_record(spec.fields) then
+            f.schema = M.new(full_name, spec.fields)?
+        else
+            return error(`rdd: document field '${full_name}' requires 'fields' or 'schema'`)
+        end
+    end
+
+    if f.type == "array" then
+        if spec.items == nil then
+            f.items = {name = `${field_name}[]`, type = "any", required = false}
+        else
+            f.items = normalize_field(`${field_name}[]`, spec.items, parent_name)?
+        end
+    end
+
+    return f
+end
+
+-- ---- field builders (rdd.field.*) ----
+
+local function make_field_spec(kind, opts)
+    local f = copy_opts(opts)
+    f.type = kind
+    return f
+end
+
+function Field.string(opts) return make_field_spec("string", opts) end
+function Field.int(opts) return make_field_spec("int", opts) end
+function Field.number(opts) return make_field_spec("number", opts) end
+function Field.bool(opts) return make_field_spec("bool", opts) end
+function Field.bytes(opts) return make_field_spec("bytes", opts) end
+function Field.time(opts) return make_field_spec("time", opts) end
+function Field.uuid(opts) return make_field_spec("uuid", opts) end
+function Field.map(opts) return make_field_spec("map", opts) end
+function Field.any(opts) return make_field_spec("any", opts) end
+
+function Field.document(fields_or_schema, opts)
+    local f = copy_opts(opts)
+    f.type = "document"
+    if is_record(fields_or_schema) and fields_or_schema.__is_schema then
+        f.schema = fields_or_schema
+    else
+        f.fields = fields_or_schema
+    end
+    return f
+end
+
+function Field.array(items, opts)
+    local f = copy_opts(opts)
+    f.type = "array"
+    f.items = items
+    return f
+end
+
+M.field = Field
+
+-- ---- value validation ----
+
+local UUID_RE = "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+
+local function clone_map(m)
+    local out = {}
+    for k, v in m do out[k] = v end
+    return out
+end
+
+local validate_value
+
+validate_value = function(f, val, path, opts)
+    local t = f.type
+    if t == "any" then return val end
+
+    if t == "string" or t == "bytes" then
+        if type(val) ~= "string" then
+            return error(`rdd: field '${path}' expected ${t}, got ${type(val)}`)
+        end
+        if f.min ~= nil and len(val) < f.min then
+            return error(`rdd: field '${path}' length must be >= ${f.min}`)
+        end
+        if f.max ~= nil and len(val) > f.max then
+            return error(`rdd: field '${path}' length must be <= ${f.max}`)
+        end
+        return val
+    end
+
+    if t == "uuid" then
+        if type(val) ~= "string" or not re.test(UUID_RE, val) then
+            return error(`rdd: field '${path}' expected valid uuid string, got ${tostring(val)}`)
+        end
+        return val
+    end
+
+    if t == "int" then
+        if type(val) ~= "int" then
+            return error(`rdd: field '${path}' expected int, got ${type(val)}`)
+        end
+        if f.min ~= nil and val < f.min then
+            return error(`rdd: field '${path}' must be >= ${f.min}`)
+        end
+        if f.max ~= nil and val > f.max then
+            return error(`rdd: field '${path}' must be <= ${f.max}`)
+        end
+        return val
+    end
+
+    if t == "number" then
+        local vt = type(val)
+        if vt ~= "number" and vt ~= "int" then
+            return error(`rdd: field '${path}' expected number, got ${vt}`)
+        end
+        if f.min ~= nil and val < f.min then
+            return error(`rdd: field '${path}' must be >= ${f.min}`)
+        end
+        if f.max ~= nil and val > f.max then
+            return error(`rdd: field '${path}' must be <= ${f.max}`)
+        end
+        return val
+    end
+
+    if t == "bool" then
+        if type(val) ~= "bool" then
+            return error(`rdd: field '${path}' expected bool, got ${type(val)}`)
+        end
+        return val
+    end
+
+    if t == "time" then
+        local vt = type(val)
+        if vt == "int" or vt == "string" then return val end
+        if is_record(val) and type(val.iso) == "function" then return val:iso() end
+        return error(`rdd: field '${path}' expected time (Time, ISO string, or unix int), got ${vt}`)
+    end
+
+    if t == "map" then
+        if not is_record(val) then
+            return error(`rdd: field '${path}' expected map/table, got ${type(val)}`)
+        end
+        return clone_map(val)
+    end
+
+    if t == "document" then
+        if not is_record(val) then
+            return error(`rdd: field '${path}' expected document, got ${type(val)}`)
+        end
+        return f.schema:validate(val, {path_prefix = path, partial = opts and opts.partial or false})
+    end
+
+    if t == "array" then
+        if type(val) ~= "array" then
+            return error(`rdd: field '${path}' expected array, got ${type(val)}`)
+        end
+        if f.min ~= nil and len(val) < f.min then
+            return error(`rdd: field '${path}' requires at least ${f.min} items`)
+        end
+        if f.max ~= nil and len(val) > f.max then
+            return error(`rdd: field '${path}' allows at most ${f.max} items`)
+        end
+        local out = []
+        for i, item in val do
+            local item_path = `${path}[${i}]`
+            local v = validate_value(f.items, item, item_path, opts)?
+            if f.items.validate ~= nil then
+                local ok = f.items.validate(v, item_path)
+                if is_error(ok) then return ok end
+                if ok == false then return error(`rdd: validation failed for '${item_path}'`) end
+            end
+            out[] = v
+        end
+        return out
+    end
+
+    return error(`rdd: unsupported type '${t}' at '${path}'`)
+end
+
+-- ---- Schema methods ----
+
+-- schema:field(name) → field_def | nil
+function Schema.field(self, name)
+    return self.fields[name]
+end
+
+-- schema:field_at(path) → field_def | nil
+-- Resolves dot-separated paths like "endereco.cidade"
+function Schema.field_at(self, path)
+    if type(path) ~= "string" then return nil end
+    local parts = string.split(path, ".")
+    local curr = self
+    for i = 0, len(parts) - 1 do
+        local p = parts[i]
+        if curr == nil then return nil end
+        local f = curr.fields[p]
+        if f == nil then return nil end
+        if i == len(parts) - 1 then return f end
+        if f.type == "document" then
+            curr = f.schema
+        else
+            return nil
+        end
+    end
+    return nil
+end
+
+-- schema:has_nested() → bool
+function Schema.has_nested(self)
+    for _, name in self.field_order do
+        local t = self.fields[name].type
+        if t == "document" or t == "array" or t == "map" then return true end
+    end
+    return false
+end
+
+-- schema:validate(doc [, opts]) → validated_doc (table) | error
+function Schema.validate(self, doc, opts)
+    opts = opts or {}
+    local prefix = opts.path_prefix or self.name
+    local partial = opts.partial == true
+
+    if not is_record(doc) then
+        return error(`rdd: '${prefix}' expected a document table/struct, got ${type(doc)}`)
+    end
+
+    -- Check for unknown fields unless schema allows extra fields
+    if not self.allow_extra then
+        for k, _ in doc do
+            if self.fields[k] == nil then
+                return error(`rdd: unknown field '${prefix}.${tostring(k)}'`)
+            end
+        end
+    end
+
+    local out = {}
+
+    for _, fname in self.field_order do
+        local f = self.fields[fname]
+        local fpath = `${prefix}.${fname}`
+        local raw = doc[fname]
+
+        if raw == nil and not partial then
+            if f.default_val ~= nil then
+                if type(f.default_val) == "function" then
+                    raw = f.default_val()
+                else
+                    raw = f.default_val
+                end
+            elseif type(f.auto) == "function" then
+                raw = f.auto()
+            elseif f.auto == true and f.type == "uuid" then
+                raw = os.uuid()
+            elseif f.auto == true and f.type == "time" then
+                raw = time.now():iso()
+            end
+        end
+
+        if raw == nil then
+            if not partial and f.required and not f.auto then
+                return error(`rdd: field '${fpath}' is required`)
+            end
+        else
+            local v = validate_value(f, raw, fpath, opts)?
+            if f.validate ~= nil then
+                local ok = f.validate(v, fpath)
+                if is_error(ok) then return ok end
+                if ok == false then return error(`rdd: validation failed for '${fpath}'`) end
+            end
+            out[fname] = v
+        end
+    end
+
+    if self.allow_extra then
+        for k, v in doc do
+            if self.fields[k] == nil then out[k] = v end
+        end
+    end
+
+    return out
+end
+
+-- schema:validate_changes(changes) → validated_changes (table) | error
+-- Validates partial update fields, supporting both top-level fields and dot-paths ("endereco.cidade")
+function Schema.validate_changes(self, changes)
+    if not is_record(changes) then
+        return error(`rdd: update changes for '${self.name}' must be a table/struct, got ${type(changes)}`)
+    end
+    local out = {}
+    local count = 0
+    for k, raw in changes do
+        if type(k) ~= "string" then
+            return error(`rdd: field name must be a string, got ${type(k)}`)
+        end
+        local f = self:field_at(k)
+        if f == nil then
+            if not self.allow_extra then
+                return error(`rdd: unknown field '${self.name}.${k}' in update`)
+            end
+            out[k] = raw
+        else
+            local fpath = `${self.name}.${k}`
+            if raw == nil then
+                if f.required or f.primary_key then
+                    return error(`rdd: cannot set required field '${fpath}' to nil`)
+                end
+                out[k] = nil
+            else
+                local v = validate_value(f, raw, fpath, {partial = true})?
+                if f.validate ~= nil then
+                    local ok = f.validate(v, fpath)
+                    if is_error(ok) then return ok end
+                    if ok == false then return error(`rdd: validation failed for '${fpath}'`) end
+                end
+                out[k] = v
+            end
+        end
+        count += 1
+    end
+    if count == 0 then
+        return error(`rdd: update changes for '${self.name}' cannot be empty`)
+    end
+    return out
+end
+
+-- schema.new(name, fields [, opts]) → Schema | error
+function M.new(name, fields, opts)
+    opts = opts or {}
+    if type(name) ~= "string" or string.trim(name) == "" then
+        return error("rdd: schema name must be a non-empty string")
+    end
+    if not is_record(fields) then
+        return error(`rdd: schema '${name}' fields must be a table/struct, got ${type(fields)}`)
+    end
+
+    local norm_fields = {}
+    local order = []
+    local pk = opts.primary_key
+
+    for k, spec in fields do
+        if type(k) ~= "string" or string.trim(k) == "" then
+            return error(`rdd: schema '${name}' field names must be non-empty strings`)
+        end
+        local f = normalize_field(k, spec, name)?
+        if f.primary_key then
+            if pk ~= nil and pk ~= k then
+                return error(`rdd: schema '${name}' defines multiple primary keys ('${pk}' and '${k}')`)
+            end
+            pk = k
+        end
+        norm_fields[k] = f
+        order[] = k
+    end
+
+    if len(order) == 0 then
+        return error(`rdd: schema '${name}' must define at least one field`)
+    end
+
+    sort.sort(order)
+
+    -- If no explicit primary_key was marked, use "id" if present
+    if pk == nil and norm_fields.id ~= nil then
+        pk = "id"
+        norm_fields.id.primary_key = true
+    end
+
+    local s = {}
+    s.__is_schema = true
+    s.name = name
+    s.fields = norm_fields
+    s.field_order = order
+    s.primary_key = pk
+    s.allow_extra = opts.allow_extra == true
+    return with_methods(s, Schema)
+end
+
+return M

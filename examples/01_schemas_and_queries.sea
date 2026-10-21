@@ -1,0 +1,78 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- 01_schemas_and_queries.sea — Definindo schemas aninhados e inspecionando a AST de queries
+--
+-- Execução:
+--   ~/projects/sea_vm/bin/sea examples/01_schemas_and_queries.sea
+
+local rdd = require("../rdd")
+
+-- 1. Sub-schema de endereço (pode ser reutilizado em vários schemas)
+local Endereco = rdd.schema("enderecos", {
+    rua = {type = "string", required = true},
+    numero = "int",
+    cidade = {type = "string", required = true},
+    uf = {type = "string", default_val = "SP", min = 2, max = 2},
+})
+
+-- 2. Schema principal com sub-documento (Endereco) e lista de sub-documentos (contatos)
+local Clientes = rdd.schema("clientes", {
+    id = {type = "uuid", primary_key = true, auto = true},
+    nome = {type = "string", required = true, min = 2},
+    email = {type = "string", unique = true},
+    ativo = {type = "bool", default_val = true},
+    saldo = {type = "number", default_val = 0.0},
+    criado_em = {type = "time", auto = true},
+    endereco = Endereco,
+    tags = {type = "array", items = "string"},
+    contatos = {
+        type = "array",
+        items = {
+            tipo = {type = "string", required = true},
+            valor = {type = "string", required = true},
+        },
+    },
+})
+
+print("=== 1. Validando um documento (com defaults e campos auto-gerados) ===")
+local doc = Clientes:validate({
+    nome = "Maria Silva",
+    email = "maria@example.com",
+    endereco = {
+        rua = "Av. Paulista",
+        numero = 1000,
+        cidade = "São Paulo",
+    },
+    tags = ["vip", "varejo"],
+    contatos = [
+        {tipo = "whatsapp", valor = "+55 11 99999-0000"},
+    ],
+})
+if is_error(doc) then
+    panic(doc.message)
+end
+dump(doc)
+
+print("\n=== 2. Exemplo de erro de validação em campo aninhado ===")
+local invalido = Clientes:validate({
+    nome = "João",
+    endereco = {rua = "Rua Sem Cidade"},
+})
+if is_error(invalido) then
+    print("Erro capturado:", invalido.message)
+end
+
+print("\n=== 3. Gerando o Query Plan (AST) abstrato para drivers ===")
+local query = rdd.query(Clientes):fields("id", "nome", "saldo", "endereco.cidade"):where("ativo", true):where("saldo", ">=", 500):where("endereco.uf", "SP"):or_where(function(sub)
+    sub:where("endereco.uf", "RJ"):where_in("tags", ["vip", "ouro"])
+end):order_by("-saldo"):order_by("nome", "asc"):limit(10):offset(0)
+
+local plan = query:to_plan()
+if is_error(plan) then
+    panic(plan.message)
+end
+
+-- Remove a referência circular visual do schema apenas para exibir o plano limpo
+plan.schema = `<Schema:${plan.schema.name}>`
+dump(plan)
