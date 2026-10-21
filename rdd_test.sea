@@ -381,6 +381,47 @@ t.describe("rdd query builder and abstract query plan (AST)", function()
         t.eq(plan.offset, 40)
     end)
 
+    t.it("parses condition expressions with ? placeholders into the same plan", function()
+        local q = rdd.query(Clientes):where("(nome = ? or email = ?) and endereco.uf = ?", "A", "B", "C")
+        local plan = t.no_error(q:to_plan())
+        t.eq(len(plan.filters), 2)
+        t.eq(plan.filters[0].kind, "group")
+        t.eq(plan.filters[0].filters, [
+            {kind = "cond", logic = "and", field = "nome", op = "=", value = "A"},
+            {kind = "cond", logic = "or", field = "email", op = "=", value = "B"},
+        ])
+        t.eq(plan.filters[1], {kind = "cond", logic = "and", field = "endereco.uf", op = "=", value = "C"})
+        -- the same as the fluent form with a grouped sub-query
+        local fluent = rdd.query(Clientes):where(function(g)
+            g:where("nome", "A"):or_where("email", "B")
+        end):where("endereco.uf", "C")
+        t.eq(t.no_error(fluent:to_plan()).filters, plan.filters)
+
+        -- literals, in / not in / between / is null, keywords in any case
+        local p2 = t.no_error(rdd.query(Clientes):where(
+            "nome IN ('Ana', 'O''Brien') AND saldo BETWEEN 10 AND 20.5 AND email IS NOT NULL AND id not in ?", [7, 8]
+        ):to_plan())
+        t.eq(p2.filters[0].value, ["Ana", "O'Brien"])
+        t.eq(p2.filters[1].value, [10, 20.5])
+        t.eq(p2.filters[2].op, "is_not_null")
+        t.eq(p2.filters[3], {kind = "cond", logic = "and", field = "id", op = "not_in", value = [7, 8]})
+
+        t.is_error(rdd.query(Clientes):where("nme = ?", 1):to_plan(), "unknown field 'clientes.nme'")
+        t.is_error(rdd.query(Clientes):where("nome = ?"):to_plan(), "more '?' than values")
+        t.is_error(rdd.query(Clientes):where("nome = ?", 1, 2):to_plan(), "more values than '?'")
+        t.is_error(rdd.query(Clientes):where("(nome = ?", 1):to_plan(), "expected ')'")
+    end)
+
+    t.it("reads a mixed and/or chain with SQL precedence, made explicit", function()
+        -- a or b and c is a or (b and c): the and run becomes a group
+        local plan = t.no_error(rdd.query(Clientes):where("nome", "a"):or_where("email", "b"):where("ativo", true):to_plan())
+        t.eq(len(plan.filters), 2)
+        t.eq(plan.filters[0].field, "nome")
+        t.eq(plan.filters[1].kind, "group")
+        t.eq(plan.filters[1].logic, "or")
+        t.eq(len(plan.filters[1].filters), 2)
+    end)
+
     t.it("catches unknown fields in fluent query chains", function()
         local q = rdd.query(Clientes):where("endereco.pais", "BR"):order_by("nome")
         t.is_error(q:to_plan(), "unknown field 'clientes.endereco.pais'")
@@ -469,6 +510,17 @@ t.describe("rdd end-to-end with registered SQLite driver", function()
         t.eq(bruno.saldo, 450.0)
         t.eq(bruno.endereco.cidade, "Niterói")
         t.eq(bruno.endereco.uf, "RJ")
+
+        -- An expression, and a mixed and/or chain read with SQL precedence:
+        -- uf = RJ or (saldo > 2000 and inactive)
+        local rows = t.no_error(model:where("(endereco.uf = ? or saldo > ?) and ativo = ?", "RJ", 2000, true):all())
+        t.eq(len(rows), 1)
+        t.eq(rows[0].nome, "Bruno Lima")
+        rows = t.no_error(model:where("endereco.uf", "RJ"):or_where("saldo", ">", 2000):where("ativo", false)
+            :order_by("nome"):all())
+        t.eq(len(rows), 2)
+        t.eq(rows[0].nome, "Bruno Lima")
+        t.eq(rows[1].nome, "Carla Souza")
 
         -- Delete inactive records
         local deleted = t.no_error(model:where("ativo", false):delete())

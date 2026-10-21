@@ -79,6 +79,18 @@ local lista = clientes:where("ativo", true)
     :offset(0)
     :all()?
 
+-- Condição escrita como expressão: os valores entram como `?` (na ordem) e os
+-- campos são validados pelo schema; vira a mesma árvore do plano
+local pedidos = clientes:where("(endereco.uf = ? or endereco.uf = ?) and saldo >= ?", "SP", "RJ", 100)
+    :order_by("nome")
+    :all()?
+```
+
+Na expressão: `campo op valor` com `=`, `==`, `!=`, `<>`, `<`, `<=`, `>`, `>=`, `like`, `ilike`, `contains`, `starts_with`, `ends_with`; `campo [not] in ('a', 'b')` ou `campo [not] in ?` (um array); `campo between 1 and 9`; `campo is [not] null`. Valores: `?`, `'texto'` (`''` para uma aspa), números, `true`, `false`. `and` liga mais forte que `or`, parênteses agrupam, palavras-chave em qualquer caixa. A expressão pode ser combinada com as outras chamadas (`where`, `or_where`, grupos com função). Um campo com ponto é um caminho em sub-documento (`endereco.uf`); não há apelidos de tabela (`A.CAMPO`) nem joins.
+
+**Precedência:** numa cadeia que mistura `where` e `or_where`, vale a do SQL: `where(a):or_where(b):where(c)` é `a or (b and c)`. O plano entregue ao driver deixa isso explícito (cada trecho de `and` vira um grupo), então todo driver avalia igual, seja concatenando SQL ou avaliando da esquerda para a direita.
+
+```sea
 -- Atualização parcial (suporta campos aninhados via dot-path)
 local afetados = clientes:where("id", novo.id):update({
     saldo = 500.0,

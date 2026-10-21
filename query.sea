@@ -158,6 +158,264 @@ local function add_condition(q, logic, a, b, c, nargs)
     return q
 end
 
+-- ---- condition expressions ----
+--
+-- q:where("(campo = ? or campo2 = ?) and campo3 = ?", "A", "B", "C"): the
+-- expression is parsed into the same plan nodes as the fluent calls, with
+-- the fields checked against the schema. Values are `?` placeholders (taken
+-- in order) or literals: 'text' (two quotes for one), numbers, true, false.
+-- Conditions: field op value with op one of = == != <> < <= > >= like ilike
+-- contains starts_with ends_with; field [not] in (v, ...) or field [not] in
+-- ? (an array); field between v and v; field is [not] null. and binds
+-- tighter than or; parentheses group. Keywords in any case.
+
+local KEYWORDS = {["and"] = true, ["or"] = true, ["not"] = true, ["in"] = true, ["is"] = true, ["null"] = true,
+    between = true, like = true, ilike = true, contains = true, starts_with = true, ends_with = true,
+    ["true"] = true, ["false"] = true}
+
+-- the tokens of an expression: {kind = "name"|"kw"|"op"|"num"|"str"|"ph"|"(" |")"|",", text}
+local function tokenize(src)
+    local toks = []
+    local i = 1
+    local n = len(src)
+    while i <= n do
+        local c = string.sub(src, i, i)
+        if c == " " or c == "\t" or c == "\n" or c == "\r" then
+            i += 1
+        elseif c == "(" or c == ")" or c == "," then
+            toks[] = {kind = c, text = c}
+            i += 1
+        elseif c == "?" then
+            toks[] = {kind = "ph", text = "?"}
+            i += 1
+        elseif c == "'" then
+            local j = i + 1
+            local parts = []
+            while true do
+                if j > n then return error(`rdd: unterminated string in '${src}'`) end
+                local d = string.sub(src, j, j)
+                if d == "'" then
+                    if string.sub(src, j + 1, j + 1) == "'" then
+                        parts[] = "'"
+                        j += 2
+                    else
+                        break
+                    end
+                else
+                    parts[] = d
+                    j += 1
+                end
+            end
+            toks[] = {kind = "str", text = string.join(parts, "")}
+            i = j + 1
+        else
+            local m = re.match("^(<=|>=|<>|!=|==|=|<|>)", string.sub(src, i))
+            if m ~= nil then
+                toks[] = {kind = "op", text = m.text}
+                i += len(m.text)
+            else
+                m = re.match("^-?[0-9]+(\\.[0-9]+)?", string.sub(src, i))
+                if m ~= nil then
+                    toks[] = {kind = "num", text = m.text}
+                    i += len(m.text)
+                else
+                    m = re.match("^[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)*", string.sub(src, i))
+                    if m == nil then return error(`rdd: unexpected '${c}' in '${src}'`) end
+                    local low = string.lower(m.text)
+                    if KEYWORDS[low] then
+                        toks[] = {kind = "kw", text = low}
+                    else
+                        toks[] = {kind = "name", text = m.text}
+                    end
+                    i += len(m.text)
+                end
+            end
+        end
+    end
+    return toks
+end
+
+-- parse an expression into a tree: {type = "or"|"and", items} or {type = "cond", field, op, value}
+local function parse_expr(src, params)
+    local toks = tokenize(src)?
+    local pos = 0
+    local next_param = 0
+    local function peek() return pos < len(toks) and toks[pos] or nil end
+    local function is_kw(t, w) return t ~= nil and t.kind == "kw" and t.text == w end
+    local function fail(msg)
+        local t = peek()
+        return error(`rdd: ${msg} ${t ~= nil and ("at '" .. t.text .. "'") or "at the end"} in '${src}'`)
+    end
+    local function value()
+        local t = peek()
+        if t == nil then return fail("expected a value") end
+        pos += 1
+        if t.kind == "ph" then
+            if next_param >= len(params) then return error(`rdd: more '?' than values in '${src}'`) end
+            local v = params[next_param]
+            next_param += 1
+            return {v = v}
+        elseif t.kind == "str" then
+            return {v = t.text}
+        elseif t.kind == "num" then
+            return {v = string.contains(t.text, ".") and tonumber(t.text) or math.floor(tonumber(t.text))}
+        elseif is_kw(t, "true") then
+            return {v = true}
+        elseif is_kw(t, "false") then
+            return {v = false}
+        end
+        pos -= 1
+        return fail("expected a value")
+    end
+    local function cond()
+        local t = peek()
+        if t == nil or t.kind ~= "name" then return fail("expected a field name") end
+        pos += 1
+        local field = t.text
+        local o = peek()
+        if o == nil then return fail("expected an operator") end
+        if o.kind == "op" then
+            pos += 1
+            local op = o.text
+            if op == "==" then op = "=" end
+            if op == "<>" then op = "!=" end
+            local v = value()?
+            return {type = "cond", field = field, op = op, value = v.v}
+        end
+        if is_kw(o, "is") then
+            pos += 1
+            local neg = false
+            if is_kw(peek(), "not") then
+                pos += 1
+                neg = true
+            end
+            if not is_kw(peek(), "null") then return fail("expected null") end
+            pos += 1
+            return {type = "cond", field = field, op = neg and "is_not_null" or "is_null", value = nil}
+        end
+        local neg = false
+        if is_kw(o, "not") then
+            pos += 1
+            neg = true
+            o = peek()
+        end
+        if is_kw(o, "in") then
+            pos += 1
+            local vals = []
+            if peek() ~= nil and peek().kind == "ph" then
+                vals = value()?.v
+            else
+                if peek() == nil or peek().kind ~= "(" then return fail("expected '(' after in") end
+                pos += 1
+                while true do
+                    vals[] = value()?.v
+                    local s = peek()
+                    if s ~= nil and s.kind == "," then
+                        pos += 1
+                    elseif s ~= nil and s.kind == ")" then
+                        pos += 1
+                        break
+                    else
+                        return fail("expected ',' or ')'")
+                    end
+                end
+            end
+            return {type = "cond", field = field, op = neg and "not_in" or "in", value = vals}
+        end
+        if neg then return fail("expected in after not") end
+        if is_kw(o, "between") then
+            pos += 1
+            local lo = value()?
+            if not is_kw(peek(), "and") then return fail("expected and in between") end
+            pos += 1
+            local hi = value()?
+            return {type = "cond", field = field, op = "between", value = [lo.v, hi.v]}
+        end
+        if o.kind == "kw" and VALID_OPS[o.text] then
+            pos += 1
+            local v = value()?
+            return {type = "cond", field = field, op = o.text, value = v.v}
+        end
+        return fail("expected an operator")
+    end
+    local or_expr = nil
+    local function primary()
+        local t = peek()
+        if t ~= nil and t.kind == "(" then
+            pos += 1
+            local e = or_expr()?
+            if peek() == nil or peek().kind ~= ")" then return fail("expected ')'") end
+            pos += 1
+            return e
+        end
+        if is_kw(t, "not") then return fail("not before a condition is not supported (use !=, not in, is not null)") end
+        return cond()
+    end
+    local function and_expr()
+        local items = [primary()?]
+        while is_kw(peek(), "and") do
+            pos += 1
+            items[] = primary()?
+        end
+        return len(items) == 1 and items[0] or {type = "and", items = items}
+    end
+    or_expr = function()
+        local items = [and_expr()?]
+        while is_kw(peek(), "or") do
+            pos += 1
+            items[] = and_expr()?
+        end
+        return len(items) == 1 and items[0] or {type = "or", items = items}
+    end
+    local tree = or_expr()?
+    if peek() ~= nil then return fail("unexpected") end
+    if next_param < len(params) then return error(`rdd: more values than '?' in '${src}'`) end
+    return tree
+end
+
+-- the tree's conditions added to q: an "and" list inline, an "or" list (and
+-- anything inside it) as groups, so no driver has to know precedence
+local function add_tree(q, logic, tree)
+    if tree.type == "cond" then
+        return add_condition(q, logic, tree.field, tree.op, tree.value, 3)
+    end
+    if tree.type == "and" then
+        for i, item in tree.items do
+            -- a cond, or an "or" list, which add_tree makes a group of
+            add_tree(q, i == 0 and logic or "and", item)
+            if q._err ~= nil then return q end
+        end
+        return q
+    end
+    -- or: one group holding the alternatives
+    return add_condition(q, logic, function(sub)
+        for i, item in tree.items do
+            local l = i == 0 and "and" or "or"
+            if item.type == "cond" then
+                add_condition(sub, l, item.field, item.op, item.value, 3)
+            else
+                add_condition(sub, l, function(inner) add_tree(inner, "and", item) end, nil, nil, 1)
+            end
+            if sub._err ~= nil then return sub._err end
+        end
+    end, nil, nil, 1)
+end
+
+-- is this where() argument an expression rather than a field name?
+local function is_expression(s)
+    return type(s) == "string" and re.match("^\\s*[A-Za-z_][A-Za-z0-9_.]*\\s*$", s) == nil
+end
+
+local function add_expression(q, logic, src, params)
+    if q._err ~= nil then return q end
+    local tree = parse_expr(src, params)
+    if is_error(tree) then
+        q._err = tree
+        return q
+    end
+    return add_tree(q, logic, tree)
+end
+
 -- ---- Query builder methods ----
 
 -- q:clone() → independent copy of the query
@@ -174,22 +432,26 @@ function Query.clone(self)
     return c
 end
 
+local function where_args(q, logic, args)
+    if is_expression(args[0]) then return add_expression(q, logic, args[0], list.slice(args, 1)) end
+    return add_condition(q, logic, args[0], args[1], args[2], len(args))
+end
+
 -- q:where(field, [op,] value) | q:where({k = v}) | q:where(function(sub) ... end)
+-- | q:where("expression with ? placeholders", values...)
 function Query.where(self, ...)
-    local args = {...}
-    return add_condition(self, "and", args[0], args[1], args[2], len(args))
+    return where_args(self, "and", {...})
 end
 
 -- q:and_where(...) — alias for where(...)
 function Query.and_where(self, ...)
-    local args = {...}
-    return add_condition(self, "and", args[0], args[1], args[2], len(args))
+    return where_args(self, "and", {...})
 end
 
 -- q:or_where(field, [op,] value) | q:or_where({k = v}) | q:or_where(function(sub) ... end)
+-- | q:or_where("expression", values...)
 function Query.or_where(self, ...)
-    local args = {...}
-    return add_condition(self, "or", args[0], args[1], args[2], len(args))
+    return where_args(self, "or", {...})
 end
 
 -- q:where_in(field, list)
@@ -295,6 +557,59 @@ function Query.offset(self, n)
     return self
 end
 
+-- A list where an "and" follows an "or" (where(a):or_where(b):where(c))
+-- reads one way with SQL precedence, a or (b and c), and another left to
+-- right, (a or b) and c. The plan takes the SQL reading and makes it
+-- explicit: each run of "and" conditions becomes a group, so every driver
+-- evaluates it the same way. Lists without that mix are left as they are.
+local function canonical(filters)
+    local out = []
+    for _, f in filters do
+        if f.kind == "group" then
+            local g = {}
+            g.kind = "group"
+            g.logic = f.logic
+            g.filters = canonical(f.filters)
+            out[] = g
+        else
+            out[] = f
+        end
+    end
+    local seen_or = false
+    local mixed = false
+    for i, f in out do
+        if i > 0 then
+            if f.logic == "or" then
+                seen_or = true
+            elseif seen_or then
+                mixed = true
+            end
+        end
+    end
+    if not mixed then return out end
+    local runs = []
+    for i, f in out do
+        if i == 0 or f.logic == "or" then runs[] = [] end
+        runs[-1][] = f
+    end
+    local result = []
+    for k, run in runs do
+        local logic = k == 0 and "and" or "or"
+        if len(run) == 1 then
+            run[0].logic = logic
+            result[] = run[0]
+        else
+            run[0].logic = "and"
+            local g = {}
+            g.kind = "group"
+            g.logic = logic
+            g.filters = run
+            result[] = g
+        end
+    end
+    return result
+end
+
 -- q:to_plan() → abstract query plan table | error
 function Query.to_plan(self)
     if self._err ~= nil then return self._err end
@@ -304,7 +619,7 @@ function Query.to_plan(self)
     local fields = []
     for _, f in self._fields do fields[] = f end
     plan.fields = fields
-    plan.filters = clone_filters(self._filters)
+    plan.filters = canonical(clone_filters(self._filters))
     local orders = []
     for _, o in self._orders do orders[] = {field = o.field, dir = o.dir} end
     plan.orders = orders
