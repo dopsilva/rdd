@@ -1,0 +1,128 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- 05_cockroach_driver.sea — A loja do exemplo 03, agora no CockroachDB
+--
+-- Os schemas e as queries são os mesmos de qualquer driver; só o
+-- register_driver/open mudam. O CockroachDB acrescenta um pool de conexões
+-- que várias goroutines usam ao mesmo tempo e transações que se repetem
+-- sozinhas quando dois pedidos disputam o mesmo estoque (SQLSTATE 40001).
+--
+-- Execução (um nó local: cockroach start-single-node --insecure --background):
+--   ~/projects/sea_vm/bin/sea examples/05_cockroach_driver.sea
+-- Outro servidor: COCKROACH_URL=postgresql://usuario:senha@host:26257/banco?sslmode=verify-full&sslrootcert=ca.crt
+
+local rdd = require("../rdd")
+
+rdd.register_driver("cockroach", require("../drivers/cockroach"))
+
+local Produtos = rdd.schema("produtos", {
+    id = {type = "int", primary_key = true, auto = true},
+    nome = {type = "string", required = true},
+    categoria = {type = "string", required = true},
+    preco = {type = "number", required = true},
+    estoque = {type = "int", default_val = 0},
+    ficha = {                 -- sub-documento: uma coluna JSONB
+        switch = "string",
+        layout = "string",
+        polegadas = "int",
+        hz = "int",
+    },
+})
+
+local Pedidos = rdd.schema("pedidos", {
+    id = {type = "int", primary_key = true, auto = true},
+    produto_id = {type = "int", required = true},
+    cliente = {type = "string", required = true},
+    quantidade = {type = "int", default_val = 1},
+    total = {type = "number", required = true},
+})
+
+-- printf conta bytes; pad completa pela contagem de caracteres (utf8)
+local function pad(s, n)
+    return s .. string.rep(" ", math.max(0, n - utf8.len(s)))
+end
+
+local function section(title)
+    print(`\n=== ${title} ===`)
+end
+
+local function main()
+    local url = os.getenv("COCKROACH_URL") or "postgresql://root@localhost:26257/defaultdb?sslmode=disable"
+    local db = rdd.open("cockroach", {url = url, max_conns = 8})?
+    defer db:close()
+
+    local _ = db:exec("DROP TABLE IF EXISTS pedidos")?
+    _ = db:exec("DROP TABLE IF EXISTS produtos")?
+    _ = db:migrate(Produtos, Pedidos)?
+    local produtos = db:model(Produtos)
+    local pedidos = db:model(Pedidos)
+
+    local itens = produtos:insert_many([
+        {nome = "Teclado Mecânico", categoria = "periféricos", preco = 450.0, estoque = 30, ficha = {switch = "brown", layout = "abnt2"}},
+        {nome = "Monitor 4K", categoria = "monitores", preco = 2200.0, estoque = 5, ficha = {polegadas = 27, hz = 144}},
+        {nome = "Mouse sem fio", categoria = "periféricos", preco = 150.0, estoque = 50},
+        {nome = "Cabo HDMI", categoria = "cabos", preco = 40.0, estoque = 200},
+    ])?
+    printf("%d produtos; ids gerados pela coluna identity: %s\n", len(itens),
+        string.join(list.map(itens, function(p) return tostring(p.id) end), ", "))
+
+    section("Periféricos até R$ 500, do mais caro ao mais barato")
+    for _, p in produtos:where("categoria", "periféricos"):where("preco", "<=", 500):order_by("-preco"):all()? do
+        printf("  %s R$ %8.2f  estoque %d\n", pad(p.nome, 18), p.preco, p.estoque)
+    end
+
+    section("Campo dentro do JSONB")
+    local monitor = produtos:where("ficha.hz", ">=", 120):first()?
+    printf("  %s: %s\n", monitor.nome, json.encode(monitor.ficha, {sort_keys = true}))
+
+    section("Compras simultâneas do Monitor 4K (estoque 5)")
+    -- 8 clientes tentam comprar ao mesmo tempo; cada compra lê o estoque, confere
+    -- e grava. As transações que colidem são repetidas pelo driver, então
+    -- exatamente 5 compras passam e o estoque nunca fica negativo.
+    local monitor_id = itens[1].id
+    local resultados = chan(8)
+    for i = 1, 8 do
+        go (function()
+            local r = db:transaction(function(tx)
+                local estoque = tx:model(Produtos)
+                local p = estoque:find(monitor_id)?
+                if p.estoque < 1 then return "esgotado" end
+                local _ = estoque:where("id", monitor_id):update({estoque = p.estoque - 1})?
+                local _ = tx:model(Pedidos):insert({produto_id = monitor_id, cliente = `cliente ${i}`, total = p.preco})?
+                return "comprou"
+            end)
+            resultados <- (is_error(r) and r.message or r)
+        end)()
+    end
+    local contagem = {}
+    for _ = 1, 8 do
+        local r = <-resultados
+        contagem[r] = (contagem[r] or 0) + 1
+    end
+    printf("  comprou: %d, esgotado: %d\n", contagem.comprou or 0, contagem.esgotado or 0)
+    printf("  estoque final: %d, pedidos gravados: %d\n", produtos:find(monitor_id)?.estoque, pedidos:count()?)
+
+    section("Vendas por produto (join + group_by no banco)")
+    for _, r in produtos:join(Pedidos, "v", "v.produto_id = id"):group_by("nome")
+        :aggregate({vendas = "count(v.id)", receita = "sum(v.total)"}):order_by("-receita"):all()? do
+        printf("  %s %d vendas, R$ %.2f\n", pad(r.nome, 12), r.vendas, r.receita)
+    end
+
+    section("save(): insere ou substitui pela chave (ON CONFLICT)")
+    local _ = produtos:save({id = itens[3].id, nome = "Cabo HDMI 2.1", categoria = "cabos", preco = 59.9, estoque = 120})?
+    local cabo = produtos:find(itens[3].id)?
+    printf("  %s agora custa R$ %.2f\n", cabo.nome, cabo.preco)
+
+    section("SQL cru")
+    for _, r in db:raw("SELECT categoria, count(*) AS n, round(avg(preco)::numeric, 2) AS media FROM produtos GROUP BY categoria ORDER BY categoria")? do
+        printf("  %s %d produto(s), média R$ %s\n", pad(r.categoria, 12), r.n, tostring(r.media))
+    end
+    return true
+end
+
+local ok = main()
+if is_error(ok) then
+    print("erro: " .. ok.message)
+    os.exit(1)
+end

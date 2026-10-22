@@ -1,0 +1,223 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- driver_suite — the same end-to-end tests for every RDD driver
+--
+--   local suite = require("./driver_suite")
+--   suite.define(t, "nome do grupo", function() return rdd.open("sqlite", {...}) end,
+--       {transactions = true})
+--
+-- open() gives a fresh session; the suite drops and creates its tables
+-- (clientes, pedidos) before each test. caps.transactions = false skips the
+-- rollback test (drivers without transactions).
+
+local rdd = require("./rdd")
+
+local M = {}
+
+local Clientes = rdd.schema("clientes", {
+    id = {type = "int", primary_key = true, auto = true},
+    nome = {type = "string", required = true, min = 2},
+    email = {type = "string"},
+    ativo = {type = "bool", default_val = true},
+    saldo = {type = "number", default_val = 0.0},
+    endereco = {
+        cidade = {type = "string", required = true},
+        uf = {type = "string", default_val = "SP"},
+        numero = "int",
+    },
+    tags = {type = "array", items = "string"},
+})
+
+local Pedidos = rdd.schema("pedidos", {
+    id = {type = "int", primary_key = true, auto = true},
+    cliente_id = {type = "int", required = true},
+    produto = {type = "string", required = true},
+    valor = "number",
+    pago = {type = "bool", default_val = false},
+})
+
+M.Clientes = Clientes
+M.Pedidos = Pedidos
+
+local PEOPLE = [
+    {nome = "Ana", email = "ana@x.com", saldo = 10.0, endereco = {cidade = "Santos", uf = "SP", numero = 10}, tags = ["vip"]},
+    {nome = "Bia_1", email = "bia@x.com", saldo = 20.0, ativo = false, endereco = {cidade = "Rio", uf = "RJ", numero = 9}},
+    {nome = "Caio 50%", saldo = 30.0, endereco = {cidade = "Campinas", uf = "SP", numero = 100}, tags = []},
+    {nome = "Duda", email = "duda@x.com", saldo = 40.0, endereco = {cidade = "Recife", uf = "PE"}},
+    {nome = "Eva", email = "eva@x.com", saldo = 50.0, endereco = {cidade = "Osasco", uf = "SP"}, tags = ["vip", "atacado"]},
+]
+
+-- suite.define(t, name, open, caps)
+function M.define(t, name, open, caps)
+    caps = caps or {}
+    t.describe(name, function()
+        local db = nil
+        local clientes = nil
+        local pedidos = nil
+        local people = nil
+
+        local function names(q)
+            local out = []
+            for _, r in t.no_error(q:order_by("nome"):all()) do out[] = r.nome end
+            return string.join(out, ",")
+        end
+
+        t.before_each(function()
+            db = t.no_error(open())
+            t.no_error(db:exec("DROP TABLE IF EXISTS clientes"))
+            t.no_error(db:exec("DROP TABLE IF EXISTS pedidos"))
+            t.no_error(db:migrate(Clientes, Pedidos))
+            clientes = db:model(Clientes)
+            pedidos = db:model(Pedidos)
+            people = t.no_error(clientes:insert_many(PEOPLE))
+        end)
+
+        t.after_each(function()
+            if db ~= nil then db:close() end
+        end)
+
+        t.it("inserts, finds, updates and deletes documents", function()
+            t.eq(len(people), 5)
+            t.not_nil(people[0].id)
+            t.ne(people[0].id, people[1].id)
+            local one = t.no_error(clientes:insert({nome = "Fábio", endereco = {cidade = "Natal", uf = "RN"}}))
+            t.eq(t.no_error(clientes:count()), 6)
+
+            local ana = t.no_error(clientes:find(people[0].id))
+            t.eq(ana.nome, "Ana")
+            t.eq(ana.ativo, true)
+            t.eq(ana.saldo, 10.0)
+            t.eq(ana.endereco, {cidade = "Santos", uf = "SP", numero = 10})
+            t.eq(ana.tags, ["vip"])
+            t.is_nil(t.no_error(clientes:find(one.id)).email)
+
+            t.eq(t.no_error(clientes:where("id", people[1].id):update({saldo = 25.5, ["endereco.cidade"] = "Niterói"})), 1)
+            local bia = t.no_error(clientes:find(people[1].id))
+            t.eq(bia.saldo, 25.5)
+            t.eq(bia.endereco, {cidade = "Niterói", uf = "RJ", numero = 9})
+
+            t.eq(t.no_error(clientes:where("ativo", false):delete()), 1)
+            t.eq(t.no_error(clientes:where("ativo", false):delete()), 0)
+            t.eq(t.no_error(clientes:count()), 5)
+        end)
+
+        t.it("filters with every operator", function()
+            t.eq(names(clientes:where("endereco.uf", "SP"):where("saldo", ">", 15)), "Caio 50%,Eva")
+            t.eq(names(clientes:in("endereco.uf", ["RJ", "PE"])), "Bia_1,Duda")
+            -- numbers inside a document compare as numbers ("9" > "50" as text)
+            t.eq(names(clientes:where("endereco.numero", ">", 50)), "Caio 50%")
+            t.eq(names(clientes:where("endereco.numero", 9)), "Bia_1")
+            t.eq(names(clientes:query():order_by("-endereco.numero"):limit(2)), "Caio 50%,Ana")
+            t.eq(names(clientes:not_in("endereco.uf", ["SP", "RJ"])), "Duda")
+            t.eq(names(clientes:in("nome", [])), "")
+            t.eq(names(clientes:between("saldo", 15, 35)), "Bia_1,Caio 50%")
+            t.eq(names(clientes:is_null("email")), "Caio 50%")
+            t.eq(names(clientes:where("email", "!=", nil):where("saldo", "<", 30)), "Ana,Bia_1")
+            t.eq(names(clientes:where("email = ? or nome = ?", nil, "Ana")), "Ana,Caio 50%")
+            t.eq(names(clientes:where("nome", "contains", "50%")), "Caio 50%")
+            t.eq(names(clientes:where("nome", "contains", "_")), "Bia_1")
+            t.eq(names(clientes:where("nome", "starts with", "D")), "Duda")
+            t.eq(names(clientes:where("nome", "ends_with", "a")), "Ana,Duda,Eva")
+            t.eq(names(clientes:where("nome", "ilike", "e%")), "Eva")
+            t.eq(names(clientes:where("endereco.uf", "RJ"):or("saldo", ">", 45):where("ativo", true)), "Bia_1,Eva")
+            t.eq(names(clientes:where("(endereco.uf = ? or saldo > ?) and ativo = ?", "RJ", 35, true)), "Duda,Eva")
+            t.eq(names(clientes:where("nome", "!=", "Ana"):limit(2):offset(1)), "Caio 50%,Duda")
+            t.eq(t.no_error(clientes:where("saldo", ">", 10):limit(2):count()), 2)
+            t.eq(t.no_error(clientes:query():offset(3):count()), 2)
+            t.ok(t.no_error(clientes:where("nome", "Eva"):exists()))
+            local proj = t.no_error(clientes:where("nome", "Ana"):fields("nome", "endereco.uf"):first())
+            t.eq(proj.endereco.uf, "SP")
+            t.is_nil(proj.saldo)
+        end)
+
+        t.it("aggregates and paginates", function()
+            local rows = t.no_error(clientes:group_by("endereco.uf")
+                :aggregate({n = "count(*)", total = "sum(saldo)", emails = "count(email)", maior = "max(saldo)"})
+                :order_by("-total"):all())
+            t.eq(len(rows), 3)
+            t.eq(rows[0]["endereco.uf"], "SP")
+            t.eq(rows[0].n, 3)
+            t.eq(rows[0].total, 90.0)
+            t.eq(rows[0].emails, 2)
+            t.eq(rows[0].maior, 50.0)
+            rows = t.no_error(clientes:group_by("ativo"):aggregate({media = "avg(saldo)"}):order_by("ativo"):all())
+            t.eq(rows[0].ativo, false)
+            t.eq(rows[0].media, 20.0)
+            t.eq(t.no_error(clientes:sum("saldo")), 150.0)
+            t.eq(t.no_error(clientes:where("endereco.uf", "SP"):avg("saldo")), 30.0)
+            t.eq(t.no_error(clientes:min("nome")), "Ana")
+            t.is_nil(t.no_error(clientes:where("saldo", ">", 100):sum("saldo")))
+            local pg = t.no_error(clientes:order_by("nome"):paginate(2, 2))
+            t.eq(pg.total, 5)
+            t.eq(pg.pages, 3)
+            t.eq(pg.items[0].nome, "Caio 50%")
+        end)
+
+        t.it("joins", function()
+            local _ = t.no_error(pedidos:insert_many([
+                {cliente_id = people[0].id, produto = "Mouse", valor = 50.0, pago = true},
+                {cliente_id = people[0].id, produto = "Monitor", valor = 900.0},
+                {cliente_id = people[1].id, produto = "Teclado", valor = 200.0, pago = true},
+            ]))
+            local rows = t.no_error(clientes:join(Pedidos, "p", "p.cliente_id = id")
+                :where("p.valor > ? and endereco.uf = ?", 40, "SP"):order_by("-p.valor"):all())
+            t.eq(len(rows), 2)
+            t.eq(rows[0].nome, "Ana")
+            t.eq(rows[0].p.produto, "Monitor")
+            t.eq(rows[0].p.pago, false)
+            rows = t.no_error(clientes:left_join(Pedidos, "p", "p.cliente_id = id")
+                :group_by("nome"):aggregate({n = "count(p.id)", total = "sum(p.valor)"}):order_by("nome"):all())
+            t.eq(len(rows), 5)
+            t.eq(rows[0].total, 950.0)
+            t.eq(rows[2].n, 0)
+            t.is_nil(rows[2].total)
+            rows = t.no_error(clientes:left_join(Pedidos, "p", "p.cliente_id = id"):where("p.id", nil)
+                :fields("nome", "p.produto"):order_by("nome"):all())
+            t.eq(len(rows), 3)
+            t.is_nil(rows[0].p)
+            t.eq(t.no_error(clientes:join(Pedidos, "p", "p.cliente_id = id"):sum("p.valor")), 1150.0)
+        end)
+
+        t.it("runs raw SQL", function()
+            local rows = t.no_error(db:raw("SELECT nome FROM clientes WHERE saldo > ? AND nome <> ? ORDER BY nome", 25, "Duda"))
+            t.eq(rows, [{nome = "Caio 50%"}, {nome = "Eva"}])
+            local docs = t.no_error(clientes:raw("SELECT * FROM clientes WHERE nome = ?", "Eva"))
+            t.eq(docs[0].tags, ["vip", "atacado"])
+            t.eq(docs[0].ativo, true)
+            t.eq(names(clientes:where(rdd.raw("saldo * 2 > ?", 70))), "Duda,Eva")
+        end)
+
+        t.it("saves (insert or replace by key)", function()
+            local a = t.no_error(clientes:save({nome = "Gil", endereco = {cidade = "Belém", uf = "PA"}}))
+            t.not_nil(a.id)
+            t.no_error(clientes:save({id = a.id, nome = "Gil B", saldo = 2.0, endereco = {cidade = "Belém", uf = "PA"}}))
+            t.no_error(clientes:save({id = 9000, nome = "Novo", endereco = {cidade = "Lima"}}))
+            t.eq(t.no_error(clientes:count()), 7)
+            local gil = t.no_error(clientes:find(a.id))
+            t.eq(gil.nome, "Gil B")
+            t.eq(gil.saldo, 2.0)
+            t.eq(t.no_error(clientes:find(9000)).endereco.uf, "SP")
+            local next = t.no_error(clientes:insert({nome = "Depois", endereco = {cidade = "X"}}))
+            t.ne(next.id, 9000)
+        end)
+
+        local tx_test = caps.transactions == false and t.skip or t.it
+        tx_test("rolls back a failed transaction", function()
+            local res = db:transaction(function(tx)
+                local _ = tx:model(Clientes):insert({nome = "Temp", endereco = {cidade = "X"}})?
+                return error("abort transaction")
+            end)
+            t.is_error(res, "abort transaction")
+            t.eq(t.no_error(clientes:count()), 5)
+            local ok = t.no_error(db:transaction(function(tx)
+                local m = tx:model(Clientes)
+                local _ = m:insert({nome = "Fica", endereco = {cidade = "X"}})?
+                return m:count()
+            end))
+            t.eq(ok, 6)
+        end)
+    end)
+end
+
+return M

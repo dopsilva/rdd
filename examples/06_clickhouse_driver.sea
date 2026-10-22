@@ -1,0 +1,132 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- 06_clickhouse_driver.sea — Eventos de um site no ClickHouse, com a mesma API
+--
+-- O ClickHouse é um banco analítico: grava em lote e agrega milhões de linhas
+-- depressa. Pelo RDD, as queries são as mesmas dos outros drivers (filtros,
+-- group_by/aggregate, joins, paginação); o driver gera SQL do ClickHouse com
+-- parâmetros tipados. Diferenças: não há transações, e update/delete viram
+-- mutações (ALTER TABLE ... UPDATE / DELETE) que o driver espera terminar.
+--
+-- Execução (um servidor local:
+--   docker run -d -p 8123:8123 -e CLICKHOUSE_PASSWORD=secret clickhouse/clickhouse-server):
+--   CLICKHOUSE_URL=http://default:secret@localhost:8123/default ~/projects/sea_vm/bin/sea examples/06_clickhouse_driver.sea
+
+local rdd = require("../rdd")
+
+rdd.register_driver("clickhouse", require("../drivers/clickhouse"))
+
+local Paginas = rdd.schema("paginas", {
+    id = {type = "int", primary_key = true},
+    caminho = {type = "string", required = true},
+    secao = {type = "string", required = true},
+})
+
+local Eventos = rdd.schema("eventos", {
+    id = {type = "int", primary_key = true, auto = true},
+    pagina_id = {type = "int", required = true},
+    pais = {type = "string", required = true},
+    ms = {type = "int", required = true},
+    convertido = {type = "bool", default_val = false},
+    cliente = {                -- sub-documento: texto JSON numa coluna String
+        dispositivo = "string",
+        navegador = "string",
+    },
+})
+
+local function section(title)
+    print(`\n=== ${title} ===`)
+end
+
+-- printf conta bytes; pad completa pela contagem de caracteres (utf8)
+local function pad(s, n)
+    return s .. string.rep(" ", math.max(0, n - utf8.len(s)))
+end
+
+local function main()
+    local url = os.getenv("CLICKHOUSE_URL") or "http://default:@localhost:8123/default"
+    local db = rdd.open("clickhouse", {url = url})?
+    defer db:close()
+
+    local _ = db:exec("DROP TABLE IF EXISTS eventos")?
+    _ = db:exec("DROP TABLE IF EXISTS paginas")?
+    _ = db:migrate(Paginas, Eventos)?
+    local paginas = db:model(Paginas)
+    local eventos = db:model(Eventos)
+
+    _ = paginas:insert_many([
+        {id = 1, caminho = "/", secao = "home"},
+        {id = 2, caminho = "/docs/inicio", secao = "docs"},
+        {id = 3, caminho = "/docs/api", secao = "docs"},
+        {id = 4, caminho = "/precos", secao = "vendas"},
+        {id = 5, caminho = "/blog/lancamento", secao = "blog"},
+    ])?
+
+    -- 20 mil eventos sintéticos, gravados num único lote (JSONEachRow)
+    math.randomseed(42)
+    local paises = ["BR", "BR", "BR", "PT", "US", "AR"]
+    local dispositivos = ["celular", "celular", "desktop", "tablet"]
+    local navegadores = ["firefox", "chrome", "chrome", "safari"]
+    local lote = []
+    for i = 1, 20000 do
+        local pagina = math.random(1, 5)
+        lote[] = {
+            pagina_id = pagina,
+            pais = paises[math.random(0, len(paises) - 1)],
+            ms = math.random(20, pagina == 3 and 1500 or 400),
+            convertido = pagina == 4 and math.random(1, 10) <= 3,
+            cliente = {
+                dispositivo = dispositivos[math.random(0, 3)],
+                navegador = navegadores[math.random(0, 3)],
+            },
+        }
+    end
+    local t0 = time.now()
+    local gravados = eventos:insert_many(lote)?
+    printf("%d eventos gravados em %.2f s (ids %d a %d, dados pelo driver)\n",
+        len(gravados), time.since(t0) / 1e9, gravados[0].id, gravados[len(gravados) - 1].id)
+
+    section("Visitas e tempo médio por seção (join + group_by)")
+    for _, r in eventos:join(Paginas, "p", "p.id = pagina_id"):group_by("p.secao")
+        :aggregate({visitas = "count(*)", tempo = "avg(ms)", mais_lento = "max(ms)"})
+        :order_by("-visitas"):all()? do
+        printf("  %s %6d visitas, média %4.0f ms, máximo %d ms\n", pad(r["p.secao"], 8), r.visitas, r.tempo, r.mais_lento)
+    end
+
+    section("Conversão da página de preços por país")
+    for _, r in eventos:where("pagina_id", 4):group_by("pais")
+        :aggregate({visitas = "count(*)"}):order_by("pais"):all()? do
+        local convertidos = eventos:where({pagina_id = 4, pais = r.pais, convertido = true}):count()?
+        printf("  %s %4d visitas, %4d conversões (%.1f%%)\n", r.pais, r.visitas, convertidos, 100 * convertidos / r.visitas)
+    end
+
+    section("Campos do sub-documento: celulares com Safari na documentação")
+    local n = eventos:where("cliente.dispositivo", "celular"):where("cliente.navegador", "safari")
+        :in("pagina_id", [2, 3]):count()?
+    printf("  %d eventos\n", n)
+
+    section("Paginação dos eventos mais lentos")
+    local pg = eventos:where("ms", ">", 1400):order_by("-ms", "id"):paginate(1, 3)?
+    printf("  %d eventos acima de 1,4 s, %d páginas; a primeira:\n", pg.total, pg.pages)
+    for _, e in pg.items do printf("    #%d página %d, %d ms, %s/%s\n", e.id, e.pagina_id, e.ms, e.cliente.dispositivo, e.cliente.navegador) end
+
+    section("SQL cru com funções do ClickHouse (quantis)")
+    for _, r in db:raw("SELECT pagina_id, quantile(0.5)(ms) AS p50, quantile(0.95)(ms) AS p95 FROM eventos " ..
+        "WHERE pais = ? GROUP BY pagina_id ORDER BY pagina_id", "BR")? do
+        printf("  página %d: p50 %4.0f ms, p95 %4.0f ms\n", r.pagina_id, r.p50, r.p95)
+    end
+
+    section("Mutações: update e delete")
+    local corrigidos = eventos:where("pais", "AR"):where("ms", ">", 1000):update({convertido = true})?
+    printf("  %d eventos lentos da Argentina marcados como convertidos\n", corrigidos)
+    local removidos = eventos:where("cliente.dispositivo", "tablet"):delete()?
+    printf("  %d eventos de tablet removidos; restam %d\n", removidos, eventos:count()?)
+    return true
+end
+
+local ok = main()
+if is_error(ok) then
+    print("erro: " .. ok.message)
+    os.exit(1)
+end

@@ -1,0 +1,203 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- drivers/clickhouse — RDD driver for ClickHouse
+--
+-- Uses sea_vm's libs/clickhouse (the HTTP interface) and rdd.sql's
+-- clickhouse dialect: queries, joins, aggregates and paging run in the
+-- server with typed parameters ({p1:Int64}, ...).
+--
+--   local rdd = require("rdd/rdd")
+--   rdd.register_driver("clickhouse", require("rdd/drivers/clickhouse"))
+--   local db = rdd.open("clickhouse", {url = "http://default:secret@localhost:8123/default"})?
+--
+-- open(opts): opts.url (or uri) and the other clickhouse.open options;
+-- opts.engine replaces "MergeTree" in the tables migrate creates.
+--
+-- ClickHouse is an analytics database, and some things work differently:
+-- * migrate creates MergeTree tables ordered by the primary key; fields that
+--   are not required (and not the key) are Nullable; documents, arrays and
+--   maps are JSON text in String columns. The key is not unique: the engine
+--   does not check it.
+-- * auto integer keys are given by the driver (the largest key + 1, kept per
+--   table by this connection), so only one writer should insert into a table
+--   with auto keys.
+-- * update is an ALTER TABLE ... UPDATE mutation and delete a lightweight
+--   DELETE, both waited for; the key column cannot be updated. save() deletes
+--   the row with that key and inserts the new one.
+-- * there are no transactions: db:transaction(fn) just runs fn, and nothing
+--   is rolled back when it fails.
+
+local clickhouse = require("../../sea_vm/libs/clickhouse/clickhouse")
+local sql = require("../sql")
+
+local M = {}
+
+M.clickhouse = clickhouse
+
+local SETTINGS = {
+    join_use_nulls = 1,                     -- a left join with no match gives NULLs
+    aggregate_functions_null_for_empty = 1, -- sum/avg/max of no rows is NULL
+    mutations_sync = 2,                     -- update waits for the mutation
+}
+
+-- the query/exec/value/close shape rdd.sql.connection expects; fills in the
+-- types of the {pN:__} placeholders
+local function handle(ch)
+    local a = {}
+    a.query = function(self, s, params)
+        local text, named = sql.clickhouse_params(s, params)
+        return ch:query(text, named)
+    end
+    a.value = function(self, s, params)
+        local text, named = sql.clickhouse_params(s, params)
+        return ch:value(text, named)
+    end
+    a.exec = function(self, s, params)
+        local text, named = sql.clickhouse_params(s, params)
+        local r = ch:exec(text, named)?
+        return r.written_rows or 0
+    end
+    a.close = function(self) return ch:close() end
+    return a
+end
+
+local function column_type(d, f)
+    local t = d.types[f.type] or d.types.any
+    if not f.primary_key and not f.required then t = `Nullable(${t})` end
+    return t
+end
+
+-- clickhouse.create_table(schema [, engine]) → CREATE TABLE sql
+function M.create_table(schema, engine)
+    local d = sql.dialects.clickhouse
+    local cols = []
+    for _, fname in schema.field_order do
+        cols[] = `${d.quote(fname)} ${column_type(d, schema.fields[fname])}`
+    end
+    local order = schema.primary_key ~= nil and d.quote(schema.primary_key) or "tuple()"
+    return `CREATE TABLE IF NOT EXISTS ${d.quote(schema.name)} (${string.join(cols, ", ")}) ENGINE = ${engine or "MergeTree"} ORDER BY ${order}`
+end
+
+-- clickhouse.connection(ch [, opts]) → RDD connection over a clickhouse.open db
+function M.connection(ch, opts)
+    opts = opts or {}
+    local d = sql.dialects.clickhouse
+    local c = sql.connection(handle(ch), d)
+    c.ch = ch
+    local ids = {}
+    local ids_mu = sync.mutex()
+
+    -- the next n auto keys of a table
+    local function reserve(schema, n)
+        local pk = schema.primary_key
+        ids_mu:acquire()
+        defer ids_mu:release()
+        if ids[schema.name] == nil then
+            local top = ch:value(`SELECT max(${d.quote(pk)}) FROM ${d.quote(schema.name)}`, nil, {settings = SETTINGS})?
+            ids[schema.name] = top or 0
+        end
+        local first = ids[schema.name] + 1
+        ids[schema.name] += n
+        return first
+    end
+
+    -- a key brought by the document moves the counter past it
+    local function saw_key(schema, v)
+        if type(v) ~= "int" then return end
+        ids_mu:acquire()
+        if ids[schema.name] ~= nil and v > ids[schema.name] then ids[schema.name] = v end
+        ids_mu:release()
+    end
+
+    c.migrate = function(self, schema)
+        local _ = ch:exec(M.create_table(schema, opts.engine))?
+        return true
+    end
+
+    c.insert_many = function(self, schema, docs)
+        local pk = schema.primary_key
+        local auto = pk ~= nil and schema.fields[pk].auto == true and schema.fields[pk].type == "int"
+        local missing = 0
+        for _, doc in docs do
+            if auto and doc[pk] == nil then missing += 1 end
+        end
+        local next_id = 0
+        if missing > 0 then next_id = reserve(schema, missing)? end
+        local out = []
+        local rows = []
+        for _, doc in docs do
+            local copy = {}
+            for k, v in doc do copy[k] = v end
+            if auto and copy[pk] == nil then
+                copy[pk] = next_id
+                next_id += 1
+            elseif pk ~= nil then
+                saw_key(schema, copy[pk])
+            end
+            local row = {}
+            for k, v in copy do row[k] = d.bind(v, schema.fields[k]) end
+            rows[] = row
+            out[] = copy
+        end
+        local _ = ch:insert(schema.name, rows)?
+        return out
+    end
+
+    c.insert = function(self, schema, doc)
+        local out = self:insert_many(schema, [doc])?
+        return out[0]
+    end
+
+    c.upsert = function(self, schema, doc)
+        local pk = schema.primary_key
+        local _ = self.db:exec(`DELETE FROM ${d.quote(schema.name)} WHERE ${d.quote(pk)} = ${d.placeholder(1)}`, [doc[pk]])?
+        return self:insert(schema, doc)
+    end
+
+    -- mutations do not report how many rows they change: count them first
+    c.update = function(self, schema, plan, changes)
+        local n = self:count(schema, plan)?
+        if n == 0 then return 0 end
+        local st = sql.update(schema, plan, changes, d)?
+        local at = string.find(st.sql, " SET ")
+        local s = "ALTER TABLE " .. string.sub(st.sql, 8, at - 1) .. " UPDATE " .. string.sub(st.sql, at + 5)
+        if not string.contains(s, " WHERE ") then s ..= " WHERE 1" end
+        local _ = self.db:exec(s, st.params)?
+        return n
+    end
+
+    c.delete = function(self, schema, plan)
+        local n = self:count(schema, plan)?
+        if n == 0 then return 0 end
+        local st = sql.delete(schema, plan, d)?
+        local s = st.sql
+        if not string.contains(s, " WHERE ") then s ..= " WHERE 1" end
+        local _ = self.db:exec(s, st.params)?
+        return n
+    end
+
+    return c
+end
+
+-- open(opts) → RDD connection | error
+function M.open(opts)
+    local o = {}
+    local url = nil
+    local settings = {}
+    for k, v in SETTINGS do settings[k] = v end
+    for k, v in opts or {} do
+        if k == "url" or k == "uri" then
+            url = v
+        elseif k == "settings" then
+            for sk, sv in v do settings[sk] = sv end
+        elseif k ~= "engine" then
+            o[k] = v
+        end
+    end
+    o.settings = settings
+    local ch = clickhouse.open(url, o)?
+    return M.connection(ch, opts)
+end
+
+return M

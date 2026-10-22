@@ -1,0 +1,72 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- drivers/cockroach — RDD driver for CockroachDB (and PostgreSQL)
+--
+-- Uses sea_vm's libs/cockroach (the PostgreSQL wire protocol in pure Sea)
+-- and compiles the plans with rdd.sql's cockroach dialect, so filters,
+-- joins, aggregates, paging and save()'s upsert all run in the database.
+--
+--   local rdd = require("rdd/rdd")
+--   rdd.register_driver("cockroach", require("rdd/drivers/cockroach"))
+--   local db = rdd.open("cockroach", {url = "postgresql://root@localhost:26257/defaultdb?sslmode=disable"})?
+--
+-- open(opts): opts.url (or uri) is the connection URL; every other key goes
+-- to crdb.open (max_conns, sslmode, sslrootcert, password, ...), and
+-- opts.dialect picks another rdd.sql dialect (rdd.sql.dialects.postgres for
+-- PostgreSQL). db:transaction(fn) runs fn on the transaction's connection and
+-- runs it again when CockroachDB reports a conflict (SQLSTATE 40001), so fn
+-- should only touch the database.
+
+local crdb = require("../../sea_vm/libs/cockroach/cockroach")
+local sql = require("../sql")
+
+local M = {}
+
+M.crdb = crdb
+
+-- the query/exec/value/close shape rdd.sql.connection expects, over a crdb
+-- pool or transaction (both have run(sql, params, mode))
+local function handle(h)
+    local a = {}
+    a.query = function(self, s, params) return h:run(s, params or [], "rows") end
+    a.exec = function(self, s, params) return h:run(s, params or [], "exec") end
+    a.value = function(self, s, params) return h:run(s, params or [], "value") end
+    a.close = function(self)
+        if h.close ~= nil then h:close() end
+        return true
+    end
+    return a
+end
+
+-- cockroach.connection(db [, dialect]) → RDD connection over a crdb.open pool
+function M.connection(db, dialect)
+    dialect = dialect or sql.dialects.cockroach
+    local c = sql.connection(handle(db), dialect)
+    c.crdb = db
+    c.transaction = function(self, fn)
+        return db:transaction(function(tx)
+            local tc = sql.connection(handle(tx), dialect)
+            tc.crdb = db
+            return fn(tc)
+        end)
+    end
+    return c
+end
+
+-- open(opts) → RDD connection | error
+function M.open(opts)
+    local o = {}
+    local url = nil
+    for k, v in opts or {} do
+        if k == "url" or k == "uri" then
+            url = v
+        elseif k ~= "dialect" then
+            o[k] = v
+        end
+    end
+    local db = crdb.open(url, o)?
+    return M.connection(db, opts and opts.dialect or nil)
+end
+
+return M
