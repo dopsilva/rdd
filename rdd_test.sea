@@ -80,6 +80,18 @@ t.describe("rdd driver registry", function()
 end)
 
 t.describe("rdd schema and nested document validation", function()
+    t.it("restricts a field to the values of enum", function()
+        local S = rdd.schema("pedidos_enum", {
+            status = {type = "string", enum = ["aberto", "pago"], default_val = "aberto"},
+            nivel = {type = "int", enum = [1, 2, 3]},
+        })
+        t.eq(t.no_error(S:validate({})).status, "aberto")
+        t.eq(t.no_error(S:validate({status = "pago", nivel = 2})).nivel, 2)
+        t.is_error(S:validate({status = "cancelado"}), "must be one of aberto, pago, got cancelado")
+        t.is_error(S:validate({nivel = 4}), "must be one of 1, 2, 3")
+        t.is_error(S:validate_changes({status = "x"}), "must be one of")
+    end)
+
     t.it("validates flat and chained document fields with defaults", function()
         local doc = t.no_error(Clientes:validate({
             nome = "Maria Silva",

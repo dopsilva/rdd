@@ -110,6 +110,7 @@ normalize_field = function(field_name, spec, parent_name)
     end
     f.min = spec.min
     f.max = spec.max
+    f.enum = spec.enum
     f.validate = spec.validate
 
     if f.type == "document" and f.schema == nil then
@@ -185,6 +186,20 @@ local validate_value
 
 validate_value = function(f, val, path, opts)
     local t = f.type
+    if f.enum ~= nil then
+        local found = false
+        for _, allowed in f.enum do
+            if val == allowed then
+                found = true
+                break
+            end
+        end
+        if not found then
+            local names = []
+            for _, allowed in f.enum do names[] = tostring(allowed) end
+            return error(`rdd: field '${path}' must be one of ${string.join(names, ", ")}, got ${tostring(val)}`)
+        end
+    end
     if t == "any" then return val end
 
     if t == "string" or t == "bytes" then

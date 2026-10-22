@@ -41,6 +41,8 @@ local Clientes = rdd.schema("clientes", {
 
 Tipos suportados: `"string"`, `"int"`, `"number"`, `"bool"`, `"bytes"`, `"time"`, `"uuid"`, `"map"`, `"any"`, `"document"`, `"array"`.
 
+Opções de um campo: `required`, `primary_key`, `auto`, `default_val`, `min`/`max` (tamanho de string ou array, valor de número), `enum` (a lista de valores aceitos: `status = {type = "string", enum = ["aberto", "pago"]}`), `unique`, `validate(v, caminho)`.
+
 ---
 
 ## 2. Manipulação e Queries Abstratas
