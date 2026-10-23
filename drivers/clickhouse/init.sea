@@ -7,7 +7,7 @@
 -- clickhouse dialect: queries, joins, aggregates and paging run in the
 -- server with typed parameters ({p1:Int64}, ...).
 --
---   local rdd = require("rdd/rdd")
+--   local rdd = require("rdd")
 --   rdd.register_driver("clickhouse", require("rdd/drivers/clickhouse"))
 --   local db = rdd.open("clickhouse", {url = "http://default:secret@localhost:8123/default"})?
 --
@@ -28,8 +28,10 @@
 -- * there are no transactions: db:transaction(fn) just runs fn, and nothing
 --   is rolled back when it fails.
 
+-- (in drivers/clickhouse/init.sea so that this finds Sea's library, not
+-- this file: see drivers/cockroach/init.sea)
 local clickhouse = require("clickhouse")
-local sql = require("../sql")
+local sql = require("../../sql")
 
 local M = {}
 

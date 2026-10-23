@@ -7,7 +7,7 @@
 -- and compiles the plans with rdd.sql's cockroach dialect, so filters,
 -- joins, aggregates, paging and save()'s upsert all run in the database.
 --
---   local rdd = require("rdd/rdd")
+--   local rdd = require("rdd")
 --   rdd.register_driver("cockroach", require("rdd/drivers/cockroach"))
 --   local db = rdd.open("cockroach", {url = "postgresql://root@localhost:26257/defaultdb?sslmode=disable"})?
 --
@@ -18,8 +18,11 @@
 -- runs it again when CockroachDB reports a conflict (SQLSTATE 40001), so fn
 -- should only touch the database.
 
+-- (this file is drivers/cockroach/init.sea, not drivers/cockroach.sea: a
+-- require looks next to the requiring file first, and there it would find
+-- itself instead of Sea's library)
 local crdb = require("cockroach")
-local sql = require("../sql")
+local sql = require("../../sql")
 
 local M = {}
 
