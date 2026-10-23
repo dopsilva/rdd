@@ -2,7 +2,7 @@
 -- SPDX-License-Identifier: BSD-3-Clause
 
 local t = require("sea/test")
-local sqlite = require("../sea_vm/libs/sqlite/sqlite")
+local sqlite = require("sqlite")
 local rdd = require("./rdd")
 
 -- ---- SQLite driver registered for testing RDD contracts (rdd/sql does the SQL) ----

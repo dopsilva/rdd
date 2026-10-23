@@ -9,7 +9,7 @@
 -- (the tests drop and create the tables clientes and pedidos)
 
 local t = require("sea/test")
-local sqlite = require("../sea_vm/libs/sqlite/sqlite")
+local sqlite = require("sqlite")
 local rdd = require("./rdd")
 local suite = require("./driver_suite")
 

@@ -18,7 +18,7 @@
 -- runs it again when CockroachDB reports a conflict (SQLSTATE 40001), so fn
 -- should only touch the database.
 
-local crdb = require("../../sea_vm/libs/cockroach/cockroach")
+local crdb = require("cockroach")
 local sql = require("../sql")
 
 local M = {}

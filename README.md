@@ -9,6 +9,21 @@ O RDD cuida de:
 
 ---
 
+## Instalação
+
+Num projeto Sea, pelo `sea get` (o pacote vai para `sea_modules/` e a versão fica no `sea.lock`):
+
+```sh
+sea get https://github.com/dopsilva/rdd
+```
+
+```sea
+local rdd = require("rdd")
+local cockroach = require("rdd/drivers/cockroach")   -- usa a lib cockroach do Sea, pelo nome
+```
+
+As bibliotecas do Sea que os drivers usam (`cockroach`, `clickhouse`, `sqlite`) são carregadas pelo nome: um `sea` instalado acha em `lib/sea/`, e o `bin/sea` do checkout do sea_vm acha em `libs/`. Os exemplos abaixo rodam de dentro deste repositório, por isso usam `require("./rdd")`.
+
 ## 1. Definindo Estruturas (Schemas)
 
 ```sea

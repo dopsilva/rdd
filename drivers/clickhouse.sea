@@ -28,7 +28,7 @@
 -- * there are no transactions: db:transaction(fn) just runs fn, and nothing
 --   is rolled back when it fails.
 
-local clickhouse = require("../../sea_vm/libs/clickhouse/clickhouse")
+local clickhouse = require("clickhouse")
 local sql = require("../sql")
 
 local M = {}

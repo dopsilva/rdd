@@ -11,7 +11,7 @@
 -- Execução:
 --   ~/projects/sea_vm/bin/sea examples/03_sqlite_driver.sea
 
-local sqlite = require("../../sea_vm/libs/sqlite/sqlite")
+local sqlite = require("sqlite")
 local rdd = require("../rdd")
 
 -- ---- Driver SQLite para o RDD ----
