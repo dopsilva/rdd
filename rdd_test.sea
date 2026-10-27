@@ -92,6 +92,23 @@ t.describe("rdd schema and nested document validation", function()
         t.is_error(S:validate_changes({status = "x"}), "must be one of")
     end)
 
+    t.it("keeps dates as YYYY-MM-DD: a string, or a Time's day", function()
+        local S = rdd.schema("lancamentos_data", {
+            vencimento = {type = "date", required = true},
+            criado = {type = "date", auto = true},
+        })
+        t.eq(t.no_error(S:validate({vencimento = "2026-10-31"})).vencimento, "2026-10-31")
+        t.eq(t.no_error(S:validate({vencimento = "2026-02-28"})).criado, time.now():format("2006-01-02"))
+        local noon = time.date(2026, 3, 15, 12, 0, 0, "America/Sao_Paulo")
+        t.eq(t.no_error(S:validate({vencimento = noon})).vencimento, "2026-03-15")
+        t.is_error(S:validate({vencimento = "2026-02-30"}), "expected a date")
+        t.is_error(S:validate({vencimento = "31/10/2026"}), "expected a date")
+        t.is_error(S:validate({vencimento = "2026-10-31T10:00:00Z"}), "expected a date")
+        t.is_error(S:validate({vencimento = 20261031}), "expected a date")
+        t.is_error(S:validate_changes({vencimento = "ontem"}), "expected a date")
+        t.eq(rdd.field.date({required = true}).type, "date")
+    end)
+
     t.it("validates flat and chained document fields with defaults", function()
         local doc = t.no_error(Clientes:validate({
             nome = "Maria Silva",

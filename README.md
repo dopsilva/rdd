@@ -54,7 +54,12 @@ local Clientes = rdd.schema("clientes", {
 })
 ```
 
-Tipos suportados: `"string"`, `"int"`, `"number"`, `"bool"`, `"bytes"`, `"time"`, `"uuid"`, `"map"`, `"any"`, `"document"`, `"array"`.
+Tipos suportados: `"string"`, `"int"`, `"number"`, `"bool"`, `"bytes"`, `"time"`, `"date"`, `"uuid"`, `"map"`, `"any"`, `"document"`, `"array"`.
+
+`"date"` é um dia do calendário, sem hora nem fuso: entra como `"AAAA-MM-DD"` (ou um `Time`, que vira o seu dia no
+próprio fuso), sai sempre como `"AAAA-MM-DD"`, e `auto = true` dá o dia de hoje. A coluna é `DATE` (PostgreSQL,
+CockroachDB, SQL Server), `Date32` (ClickHouse) ou `TEXT` (SQLite); como o texto `AAAA-MM-DD` ordena como as datas,
+`where("vencimento", "<=", "2026-10-31")`, `between` e `order_by` funcionam igual em todos.
 
 Opções de um campo: `required`, `primary_key`, `auto`, `default_val`, `min`/`max` (tamanho de string ou array, valor de número), `enum` (a lista de valores aceitos: `status = {type = "string", enum = ["aberto", "pago"]}`), `unique`, `validate(v, caminho)`.
 

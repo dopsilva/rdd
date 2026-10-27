@@ -27,6 +27,7 @@ local Clientes = rdd.schema("clientes", {
         numero = "int",
     },
     tags = {type = "array", items = "string"},
+    nascimento = "date",
 })
 
 local Pedidos = rdd.schema("pedidos", {
@@ -41,9 +42,12 @@ M.Clientes = Clientes
 M.Pedidos = Pedidos
 
 local PEOPLE = [
-    {nome = "Ana", email = "ana@x.com", saldo = 10.0, endereco = {cidade = "Santos", uf = "SP", numero = 10}, tags = ["vip"]},
-    {nome = "Bia_1", email = "bia@x.com", saldo = 20.0, ativo = false, endereco = {cidade = "Rio", uf = "RJ", numero = 9}},
-    {nome = "Caio 50%", saldo = 30.0, endereco = {cidade = "Campinas", uf = "SP", numero = 100}, tags = []},
+    {nome = "Ana", email = "ana@x.com", saldo = 10.0, endereco = {cidade = "Santos", uf = "SP", numero = 10}, tags = ["vip"],
+        nascimento = "1990-05-01"},
+    {nome = "Bia_1", email = "bia@x.com", saldo = 20.0, ativo = false, endereco = {cidade = "Rio", uf = "RJ", numero = 9},
+        nascimento = "1985-12-31"},
+    {nome = "Caio 50%", saldo = 30.0, endereco = {cidade = "Campinas", uf = "SP", numero = 100}, tags = [],
+        nascimento = "2001-01-01"},
     {nome = "Duda", email = "duda@x.com", saldo = 40.0, endereco = {cidade = "Recife", uf = "PE"}},
     {nome = "Eva", email = "eva@x.com", saldo = 50.0, endereco = {cidade = "Osasco", uf = "SP"}, tags = ["vip", "atacado"]},
 ]
@@ -100,6 +104,20 @@ function M.define(t, name, open, caps)
             t.eq(t.no_error(clientes:where("ativo", false):delete()), 1)
             t.eq(t.no_error(clientes:where("ativo", false):delete()), 0)
             t.eq(t.no_error(clientes:count()), 5)
+        end)
+
+        t.it("keeps dates: back as YYYY-MM-DD, compared, ordered, changed", function()
+            t.eq(t.no_error(clientes:find(people[0].id)).nascimento, "1990-05-01")
+            t.is_nil(t.no_error(clientes:find(people[3].id)).nascimento)
+            t.eq(names(clientes:where("nascimento", ">=", "1990-01-01")), "Ana,Caio 50%")
+            t.eq(names(clientes:where("nascimento", "<", "1990-01-01")), "Bia_1")
+            t.eq(names(clientes:where("nascimento", "between", "1985-12-31", "1990-05-01")), "Ana,Bia_1")
+            local order = []
+            for _, r in t.no_error(clientes:is_not_null("nascimento"):order_by("nascimento"):all()) do order[] = r.nome end
+            t.eq(order, ["Bia_1", "Ana", "Caio 50%"])
+            t.eq(t.no_error(clientes:where("id", people[3].id):update({nascimento = time.date(1999, 9, 9)})), 1)
+            t.eq(t.no_error(clientes:find(people[3].id)).nascimento, "1999-09-09")
+            t.is_error(clientes:insert({nome = "Zé", endereco = {cidade = "X"}, nascimento = "1999-02-30"}), "expected a date")
         end)
 
         t.it("filters with every operator", function()

@@ -12,6 +12,7 @@ local VALID_TYPES = {
     bool = true,
     bytes = true,
     time = true,
+    date = true,
     uuid = true,
     map = true,
     any = true,
@@ -148,6 +149,7 @@ function Field.number(opts) return make_field_spec("number", opts) end
 function Field.bool(opts) return make_field_spec("bool", opts) end
 function Field.bytes(opts) return make_field_spec("bytes", opts) end
 function Field.time(opts) return make_field_spec("time", opts) end
+function Field.date(opts) return make_field_spec("date", opts) end
 function Field.uuid(opts) return make_field_spec("uuid", opts) end
 function Field.map(opts) return make_field_spec("map", opts) end
 function Field.any(opts) return make_field_spec("any", opts) end
@@ -261,6 +263,17 @@ validate_value = function(f, val, path, opts)
         if vt == "int" or vt == "string" then return val end
         if is_record(val) and type(val.iso) == "function" then return val:iso() end
         return error(`rdd: field '${path}' expected time (Time, ISO string, or unix int), got ${vt}`)
+    end
+
+    -- a calendar day, without time or zone: "YYYY-MM-DD" (a Time gives its
+    -- day in its own zone)
+    if t == "date" then
+        if is_record(val) and type(val.format) == "function" then return val:format("2006-01-02") end
+        if type(val) == "string" and re.match("^\\d{4}-\\d{2}-\\d{2}$", val) ~= nil
+            and not is_error(time.parse(val, "2006-01-02", "UTC")) then
+            return val
+        end
+        return error(`rdd: field '${path}' expected a date (YYYY-MM-DD or a Time), got ${type(val) == "string" and val or type(val)}`)
     end
 
     if t == "map" then
@@ -380,6 +393,8 @@ function Schema.validate(self, doc, opts)
                 raw = os.uuid()
             elseif f.auto == true and f.type == "time" then
                 raw = time.now():iso()
+            elseif f.auto == true and f.type == "date" then
+                raw = time.now():format("2006-01-02")
             end
         end
 
