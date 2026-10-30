@@ -92,6 +92,12 @@ t.describe("rdd schema and nested document validation", function()
         t.is_error(S:validate_changes({status = "x"}), "must be one of")
     end)
 
+    t.it("takes \"array\" alone as an array of anything", function()
+        local S = rdd.schema("pedidos_array", {tags = "array", refs = {type = "array"}})
+        t.eq(len(t.no_error(S:validate({tags = ["a", 1, {k = 2}], refs = [{kind = "nfe"}]})).tags), 3)
+        t.is_error(S:validate({tags = "x"}), "expected array")
+    end)
+
     t.it("keeps dates as YYYY-MM-DD: a string, or a Time's day", function()
         local S = rdd.schema("lancamentos_data", {
             vencimento = {type = "date", required = true},
