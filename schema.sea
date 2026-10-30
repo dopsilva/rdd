@@ -58,6 +58,8 @@ normalize_field = function(field_name, spec, parent_name)
         f.auto = false
         f.unique = false
         f.index = false
+        -- ("array" alone: items of any type, as {type = "array"} without items)
+        if spec == "array" then f.items = {name = `${field_name}[]`, type = "any", required = false} end
         return f
     end
 
