@@ -136,6 +136,13 @@ M.dialects.postgres = M.dialect({
     placeholder = function(n) return `$${n}` end,
     has_ilike = true,
     bind = function(v, f)
+        -- binary: marked for the driver, which sends it as \x hex (in the text
+        -- format a backslash in the bytes would be read as an escape)
+        if f ~= nil and f.type == "bytes" and type(v) == "string" then
+            local b = {}
+            b.__crdb_bytes = v
+            return b
+        end
         if is_record(v) then return json.encode(v) end
         return v
     end,

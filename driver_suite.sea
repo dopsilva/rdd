@@ -30,6 +30,13 @@ local Clientes = rdd.schema("clientes", {
     nascimento = "date",
 })
 
+-- binary contents (a file): every byte back as it went, a backslash and a zero too
+local Arquivos = rdd.schema("arquivos", {
+    id = {type = "int", primary_key = true, auto = true},
+    nome = {type = "string", required = true},
+    dados = {type = "bytes"},
+})
+
 local Pedidos = rdd.schema("pedidos", {
     id = {type = "int", primary_key = true, auto = true},
     cliente_id = {type = "int", required = true},
@@ -104,6 +111,18 @@ function M.define(t, name, open, caps)
             t.eq(t.no_error(clientes:where("ativo", false):delete()), 1)
             t.eq(t.no_error(clientes:where("ativo", false):delete()), 0)
             t.eq(t.no_error(clientes:count()), 5)
+        end)
+
+        t.it("keeps binary contents: a backslash, a zero and high bytes back as they went", function()
+            t.no_error(db:exec("DROP TABLE IF EXISTS arquivos"))
+            t.no_error(db:migrate(Arquivos))
+            local arquivos = db:model(Arquivos)
+            local data = "PK\x03\x04a\\b\\\\c\x00\xff\xfe\"'\n" .. string.rep("\x5c", 3)
+            local a = t.no_error(arquivos:insert({nome = "planilha.xlsx", dados = data}))
+            local back = t.no_error(arquivos:where("id", a.id):first())
+            t.eq(back.dados, data)
+            t.no_error(arquivos:where("id", a.id):update({dados = data .. "\\x00"}))
+            t.eq(t.no_error(arquivos:where("id", a.id):first()).dados, data .. "\\x00")
         end)
 
         t.it("keeps dates: back as YYYY-MM-DD, compared, ordered, changed", function()
